@@ -98,6 +98,7 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 	bool alloc_failed = false;
 	agent->ice_tcp_mode = JUICE_ICE_TCP_MODE_NONE;
 	agent->config.concurrency_mode = config->concurrency_mode;
+	agent->config.relay_only = config->relay_only;
 	agent->config.stun_server_host = alloc_string_copy(config->stun_server_host, &alloc_failed);
 	agent->config.stun_server_port = config->stun_server_port;
 	agent->config.bind_address = alloc_string_copy(config->bind_address, &alloc_failed);
@@ -198,7 +199,8 @@ void agent_destroy(juice_agent_t *agent) {
 }
 
 static bool has_nonnumeric_server_hostnames(const juice_config_t *config) {
-	if (config->stun_server_host && !addr_is_numeric_hostname(config->stun_server_host))
+	if (!config->relay_only && config->stun_server_host &&
+	    !addr_is_numeric_hostname(config->stun_server_host))
 		return true;
 
 	for (int i = 0; i < config->turn_servers_count; ++i) {
@@ -315,7 +317,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 		JLOG_DEBUG("Gathered host candidate: %s", buffer);
 
-		if (agent->config.cb_candidate)
+		if (agent->config.cb_candidate && !agent->config.relay_only)
 			agent->config.cb_candidate(agent, buffer, agent->config.user_ptr);
 	}
 
@@ -446,7 +448,7 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 	// STUN server resolution
 	// The entry is added after so the TURN server address will be matched in priority
-	if (agent->config.stun_server_host) {
+	if (!agent->config.relay_only && agent->config.stun_server_host) {
 		if (!agent->config.stun_server_port)
 			agent->config.stun_server_port = 3478; // default STUN port
 
@@ -497,7 +499,16 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 int agent_get_local_description(juice_agent_t *agent, char *buffer, size_t size) {
 	conn_lock(agent);
-	if (ice_generate_sdp(&agent->local, buffer, size) < 0) {
+	ice_description_t local = agent->local;
+	if (agent->config.relay_only) {
+		int count = 0;
+		for (int i = 0; i < local.candidates_count; ++i) {
+			if (local.candidates[i].type == ICE_CANDIDATE_TYPE_RELAYED)
+				local.candidates[count++] = local.candidates[i];
+		}
+		local.candidates_count = count;
+	}
+	if (ice_generate_sdp(&local, buffer, size) < 0) {
 		JLOG_ERROR("Failed to generate local SDP description");
 		conn_unlock(agent);
 		return -1;
@@ -799,6 +810,16 @@ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t
 
 	if (agent->state == JUICE_STATE_DISCONNECTED || agent->state == JUICE_STATE_GATHERING)
 		return 0;
+
+	if (agent->config.relay_only && !relayed) {
+		// Direct packets are only accepted from a configured TURN server. In
+		// particular, allow ChannelData through to the normal TURN handler.
+		agent_stun_entry_t *entry = agent_find_entry_from_record(agent, src, NULL);
+		if (!entry || entry->type != AGENT_STUN_ENTRY_TYPE_RELAY) {
+			JLOG_DEBUG("Relay-only mode, ignoring datagram not received from a TURN server");
+			return -1;
+		}
+	}
 
 	if (is_stun_datagram(buf, len)) {
 		if (JLOG_DEBUG_ENABLED) {
@@ -2345,7 +2366,10 @@ int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type
 	}
 	JLOG_DEBUG("Gathered reflexive candidate: %s", buffer);
 
-	if (type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE && agent->config.cb_candidate)
+	// Preserve the default behavior: peer-reflexive candidates are not trickled.
+	// Relay-only mode also suppresses server-reflexive candidate callbacks.
+	if (type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE && agent->config.cb_candidate &&
+	    !agent->config.relay_only)
 		agent->config.cb_candidate(agent, buffer, agent->config.user_ptr);
 
 	return 0;
@@ -2497,7 +2521,7 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // lo
 int agent_add_candidate_pairs_for_remote(juice_agent_t *agent, ice_candidate_t *remote) {
 	// Here is the trick: local non-relayed candidates are undifferentiated for sending.
 	// Therefore, we don't need to match remote candidates with local ones.
-	if (agent_add_candidate_pair(agent, NULL, remote))
+	if (!agent->config.relay_only && agent_add_candidate_pair(agent, NULL, remote))
 		return -1;
 
 	// However, we need still to differenciate local relayed candidates

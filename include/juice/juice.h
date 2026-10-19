@@ -116,6 +116,9 @@ typedef struct juice_config {
 
 	void *user_ptr;
 
+	// Disable non-relayed ICE candidates and candidate pairs.
+	bool relay_only;
+
 } juice_config_t;
 
 JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config);

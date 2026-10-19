@@ -75,6 +75,7 @@ set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/stun-unhandled-unhandle.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/stun.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/gathering.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/relay-only.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/connectivity.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/turn.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/thread.c
@@ -86,6 +87,9 @@ set(TESTS_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/test/ufrag.c
 	${CMAKE_CURRENT_SOURCE_DIR}/test/tcp.c
 )
+if (NOT NO_SERVER)
+    list(APPEND TESTS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test/relay-only-turn.c)
+endif()
 source_group("Test Files" FILES "${TESTS_SOURCES}")
 
 set(FUZZER_SOURCES
@@ -242,7 +246,7 @@ if(NOT NO_TESTS)
 	set_target_properties(juice-tests PROPERTIES
 		XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.github.paullouisageneau.libjuice.tests)
 
-	target_link_libraries(juice-tests juice Threads::Threads)
+	target_link_libraries(juice-tests juice-static Threads::Threads)
 
 	if(WIN32)
 		target_link_libraries(juice-tests ws2_32)
