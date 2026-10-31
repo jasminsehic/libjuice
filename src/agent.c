@@ -867,6 +867,31 @@ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t
 
 	case AGENT_STUN_ENTRY_TYPE_CHECK:
 		JLOG_DEBUG("Received application datagram");
+		// The selected SDP address can differ from the source address actually
+		// observed by the UDP socket. Emit once per selected path, not per packet.
+		if (entry->pair && entry->pair == agent->selected_pair &&
+		    agent->last_logged_udp_pair != entry->pair && JLOG_INFO_ENABLED) {
+			const addr_record_t *socket_src =
+			    relayed && entry->relay_entry ? &entry->relay_entry->record : src;
+			char socket_address[ADDR_MAX_STRING_LEN];
+			char peer_address[ADDR_MAX_STRING_LEN];
+			char selected_address[ADDR_MAX_STRING_LEN];
+			char local_address[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(socket_src, socket_address, sizeof(socket_address));
+			addr_record_to_string(src, peer_address, sizeof(peer_address));
+			addr_record_to_string(&entry->pair->remote->resolved, selected_address,
+			                      sizeof(selected_address));
+			if (entry->pair->local)
+				addr_record_to_string(&entry->pair->local->resolved, local_address,
+				                      sizeof(local_address));
+			else
+				snprintf(local_address, sizeof(local_address), "unknown");
+			JLOG_INFO("PRIVACY_TRACE RTC_UDP_SELECTED mode=%s socket_source=%s "
+			          "logical_peer=%s selected_remote=%s selected_local=%s",
+			          relayed ? "turn" : "direct", socket_address, peer_address,
+			          selected_address, local_address);
+			agent->last_logged_udp_pair = entry->pair;
+		}
 		if (agent->config.cb_recv)
 			agent->config.cb_recv(agent, buf, len, agent->config.user_ptr);
 		return 0;
