@@ -789,6 +789,21 @@ int agent_get_selected_candidate_pair(juice_agent_t *agent, ice_candidate_t *loc
 	return 0;
 }
 
+int agent_get_selected_remote_transport_address(juice_agent_t *agent, addr_record_t *remote) {
+	conn_lock(agent);
+	agent_stun_entry_t *entry = atomic_load(&agent->selected_entry);
+	if (!entry || !entry->pair) {
+		conn_unlock(agent);
+		return -1;
+	}
+
+	// Snapshot the destination used by agent_send(). For locally relayed ICE,
+	// relay_entry->record is the TURN server and must not be returned here.
+	*remote = entry->record;
+	conn_unlock(agent);
+	return 0;
+}
+
 int agent_conn_update(juice_agent_t *agent, timestamp_t *next_timestamp) {
 	return agent_bookkeeping(agent, next_timestamp);
 }
@@ -873,23 +888,38 @@ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t
 		    agent->last_logged_udp_pair != entry->pair && JLOG_INFO_ENABLED) {
 			const addr_record_t *socket_src =
 			    relayed && entry->relay_entry ? &entry->relay_entry->record : src;
+			agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
 			char socket_address[ADDR_MAX_STRING_LEN];
 			char peer_address[ADDR_MAX_STRING_LEN];
 			char selected_address[ADDR_MAX_STRING_LEN];
+			char transport_address[ADDR_MAX_STRING_LEN];
+			char packet_entry_address[ADDR_MAX_STRING_LEN];
 			char local_address[ADDR_MAX_STRING_LEN];
 			addr_record_to_string(socket_src, socket_address, sizeof(socket_address));
 			addr_record_to_string(src, peer_address, sizeof(peer_address));
 			addr_record_to_string(&entry->pair->remote->resolved, selected_address,
 			                      sizeof(selected_address));
+			addr_record_to_string(&entry->record, packet_entry_address,
+			                      sizeof(packet_entry_address));
+			if (selected_entry)
+				addr_record_to_string(&selected_entry->record, transport_address,
+				                      sizeof(transport_address));
+			else
+				snprintf(transport_address, sizeof(transport_address), "unknown");
 			if (entry->pair->local)
 				addr_record_to_string(&entry->pair->local->resolved, local_address,
 				                      sizeof(local_address));
 			else
 				snprintf(local_address, sizeof(local_address), "unknown");
 			JLOG_INFO("PRIVACY_TRACE RTC_UDP_SELECTED mode=%s socket_source=%s "
-			          "logical_peer=%s selected_remote=%s selected_local=%s",
+			          "logical_peer=%s selected_remote=%s selected_local=%s "
+			          "selected_transport=%s packet_transport=%s "
+			          "transport_matches_source=%d selected_entry_matches_packet=%d",
 			          relayed ? "turn" : "direct", socket_address, peer_address,
-			          selected_address, local_address);
+			          selected_address, local_address, transport_address,
+			          packet_entry_address,
+			          selected_entry && addr_record_is_equal(&selected_entry->record, src, true),
+			          selected_entry == entry);
 			agent->last_logged_udp_pair = entry->pair;
 		}
 		if (agent->config.cb_recv)
