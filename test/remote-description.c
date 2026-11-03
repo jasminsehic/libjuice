@@ -42,7 +42,10 @@ int test_remote_description_early_stun(void) {
 	struct sockaddr_in address = {0};
 	address.sin_family = AF_INET;
 	address.sin_port = htons(17212);
-	address.sin_addr.s_addr = htonl(0x4f7fb8d0u); // 79.127.184.208
+	if (inet_pton(AF_INET, "79.127.184.208", &address.sin_addr) != 1) {
+		juice_destroy(agent);
+		return -1;
+	}
 	addr_record_t source = {0};
 	memcpy(&source.addr, &address, sizeof(address));
 	source.len = sizeof(address);
@@ -66,15 +69,16 @@ int test_remote_description_early_stun(void) {
 	ice_candidate_pair_t *pair = &agent->candidate_pairs[0];
 	agent_stun_entry_t *entry = &agent->entries[0];
 	uint32_t const original_priority = pair->remote->priority;
+	uint64_t const original_pair_priority = pair->priority;
 
 	// The remote SDP arrives later and advertises a private host candidate,
 	// plus the endpoint already learned by the early peer-reflexive check.
-	// Existing pairs must remain stable and the duplicate endpoint must not
-	// create another check entry.
+	// Existing pairs remain stable; signaling supplies the authoritative
+	// type, priority and foundation, without creating a duplicate pair.
 	char const sdp[] =
 	    "a=ice-ufrag:remote\r\n"
 	    "a=ice-pwd:0123456789012345678901\r\n"
-	    "a=candidate:1 1 UDP 2122260223 172.18.0.6 51029 typ host\r\n"
+	    "a=candidate:1 1 UDP 2100000000 172.18.0.6 51029 typ host\r\n"
 	    "a=candidate:2 1 UDP 2114000000 79.127.184.208 17212 typ srflx\r\n";
 	if (juice_set_remote_description(agent, sdp) != JUICE_ERR_SUCCESS) {
 		fprintf(stderr, "Failed to apply late remote SDP\n");
@@ -85,13 +89,18 @@ int test_remote_description_early_stun(void) {
 	// Previously registered pairs must not silently change their remote
 	// candidate when agent_set_remote_description() replaces the description.
 	bool const preserved = pair->remote &&
-	                       pair->remote->type == ICE_CANDIDATE_TYPE_PEER_REFLEXIVE &&
-	                       pair->remote->priority == original_priority &&
+	                       pair->remote == &agent->remote.candidates[0] &&
+	                       pair->remote->type == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE &&
+	                       pair->remote->priority == 2114000000 &&
+	                       original_priority != pair->remote->priority &&
+	                       strcmp(pair->remote->foundation, "2") == 0 &&
+	                       pair->priority != original_pair_priority &&
 	                       addr_record_is_equal(&pair->remote->resolved, &source, true) &&
 	                       addr_record_is_equal(&entry->record, &source, true) &&
 	                       agent->remote.candidates_count == 2 &&
 	                       agent->candidate_pairs_count == 2 &&
-	                       agent->entries_count == 2;
+	                       agent->entries_count == 2 &&
+	                       agent->ordered_pairs[0] == pair;
 	if (!preserved) {
 		char candidate[ADDR_MAX_STRING_LEN];
 		char transport[ADDR_MAX_STRING_LEN];
@@ -106,6 +115,25 @@ int test_remote_description_early_stun(void) {
 		        candidate, pair->remote ? (int)pair->remote->type : -1, transport);
 	}
 
+	// The same reconciliation must also work for candidates received later
+	// through the trickle API, without resetting a succeeded/nominated pair.
+	bool const first_update_ok = preserved;
+	pair->state = ICE_CANDIDATE_PAIR_STATE_SUCCEEDED;
+	pair->nominated = true;
+	char const trickled[] =
+	    "a=candidate:3 1 UDP 2115000000 79.127.184.208 17212 typ srflx";
+	bool const trickle_ok =
+	    juice_add_remote_candidate(agent, trickled) == JUICE_ERR_SUCCESS &&
+	    pair->remote == &agent->remote.candidates[0] &&
+	    pair->remote->priority == 2115000000 &&
+	    strcmp(pair->remote->foundation, "3") == 0 &&
+	    pair->state == ICE_CANDIDATE_PAIR_STATE_SUCCEEDED && pair->nominated &&
+	    agent->candidate_pairs_count == 2 && agent->entries_count == 2 &&
+	    agent->ordered_pairs[0] == pair &&
+	    addr_record_is_equal(&entry->record, &source, true);
+	if (!trickle_ok)
+		fprintf(stderr, "Trickled candidate metadata / pair priority regression failed\n");
+
 	juice_destroy(agent);
-	return preserved ? 0 : -1;
+	return first_update_ok && trickle_ok ? 0 : -1;
 }
