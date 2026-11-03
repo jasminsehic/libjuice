@@ -130,6 +130,7 @@ struct juice_agent {
 	juice_state_t state;
 	agent_mode_t mode;
 	juice_ice_tcp_mode_t ice_tcp_mode;
+	juice_ice_transport_policy_t ice_transport_policy;
 
 	ice_description_t local;
 	ice_description_t remote;
@@ -137,7 +138,7 @@ struct juice_agent {
 	ice_candidate_pair_t candidate_pairs[MAX_CANDIDATE_PAIRS_COUNT];
 	ice_candidate_pair_t *ordered_pairs[MAX_CANDIDATE_PAIRS_COUNT];
 	ice_candidate_pair_t *selected_pair;
-	// Only trace the first accepted data packet on each selected ICE path.
+	// Report accepted data only once per selected ICE path.
 	ice_candidate_pair_t *last_logged_udp_pair;
 	int candidate_pairs_count;
 
@@ -180,7 +181,6 @@ juice_state_t agent_get_state(juice_agent_t *agent);
 int agent_get_selected_candidate_pair(juice_agent_t *agent, ice_candidate_t *local,
                                       ice_candidate_t *remote);
 
-int agent_get_selected_remote_transport_address(juice_agent_t *agent, addr_record_t *remote);
 int agent_conn_recv(juice_agent_t *agent, char *buf, size_t len, const addr_record_t *src);
 int agent_conn_update(juice_agent_t *agent, timestamp_t *next_timestamp);
 int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_state_t state);
@@ -246,5 +246,7 @@ agent_find_entry_from_record(juice_agent_t *agent, const addr_record_t *record,
                              const addr_record_t *relayed); // relayed may be NULL
 void agent_translate_host_candidate_entry(juice_agent_t *agent, agent_stun_entry_t *entry);
 int agent_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
+int agent_set_ice_transport_policy(juice_agent_t *agent,
+                                   juice_ice_transport_policy_t ice_transport_policy);
 
 #endif

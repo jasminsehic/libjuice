@@ -95,6 +95,11 @@ typedef enum juice_ice_tcp_mode {
 	JUICE_ICE_TCP_MODE_ACTIVE,   // ICE-TCP will operate as a client
 } juice_ice_tcp_mode_t;
 
+typedef enum juice_ice_transport_policy {
+	JUICE_ICE_TRANSPORT_POLICY_ALL = 0, // Allow direct and relayed ICE connections
+	JUICE_ICE_TRANSPORT_POLICY_RELAY,   // Require a locally relayed ICE candidate
+} juice_ice_transport_policy_t;
+
 typedef struct juice_config {
 	juice_concurrency_mode_t concurrency_mode;
 
@@ -116,8 +121,6 @@ typedef struct juice_config {
 
 	void *user_ptr;
 
-	// Disable non-relayed ICE candidates and candidate pairs.
-	bool relay_only;
 
 } juice_config_t;
 
@@ -137,17 +140,12 @@ JUICE_EXPORT int juice_get_selected_candidates(juice_agent_t *agent, char *local
                                                char *remote, size_t remote_size);
 JUICE_EXPORT int juice_get_selected_addresses(juice_agent_t *agent, char *local, size_t local_size,
                                               char *remote, size_t remote_size);
-// Get the effective destination used for outgoing application data.
-// Unlike juice_get_selected_addresses(), this may differ from the selected
-// candidate address. When using local TURN, it is the logical peer address,
-// not the address of the TURN server.
-JUICE_EXPORT int juice_get_selected_remote_transport_address(juice_agent_t *agent, char *remote,
-                                                             size_t remote_size);
-
 JUICE_EXPORT int juice_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, const char *pwd);
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 JUICE_EXPORT int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr);
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
+JUICE_EXPORT int juice_set_ice_transport_policy(juice_agent_t *agent,
+                                               juice_ice_transport_policy_t ice_transport_policy);
 
 // ICE server
 

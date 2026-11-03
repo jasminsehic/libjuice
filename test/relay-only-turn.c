@@ -155,7 +155,6 @@ static int test_no_direct_fallback(uint16_t port, const char *username, const ch
 
 	juice_config_t relay_config;
 	memset(&relay_config, 0, sizeof(relay_config));
-	relay_config.relay_only = true;
 	relay_config.turn_servers = &turn;
 	relay_config.turn_servers_count = 1;
 	relay_config.cb_candidate = on_failure_candidate;
@@ -168,7 +167,9 @@ static int test_no_direct_fallback(uint16_t port, const char *username, const ch
 	peer_config.user_ptr = &peer_observation;
 	juice_agent_t *relay_agent = juice_create(&relay_config);
 	juice_agent_t *direct_peer = juice_create(&peer_config);
-	if (!relay_agent || !direct_peer) {
+	if (!relay_agent || !direct_peer ||
+	    juice_set_ice_transport_policy(relay_agent, JUICE_ICE_TRANSPORT_POLICY_RELAY) !=
+	        JUICE_ERR_SUCCESS) {
 		juice_destroy(relay_agent);
 		juice_destroy(direct_peer);
 		return -1;
@@ -278,7 +279,6 @@ int test_relay_only_turn(void) {
 
 	juice_config_t config1;
 	memset(&config1, 0, sizeof(config1));
-	config1.relay_only = true;
 	config1.turn_servers = &turn;
 	config1.turn_servers_count = 1;
 	config1.stun_server_host = "127.0.0.1";
@@ -297,7 +297,11 @@ int test_relay_only_turn(void) {
 	non_relay_candidate_emitted = false;
 	agent1 = juice_create(&config1);
 	agent2 = juice_create(&config2);
-	if (!agent1 || !agent2) {
+	if (!agent1 || !agent2 ||
+	    juice_set_ice_transport_policy(agent1, JUICE_ICE_TRANSPORT_POLICY_RELAY) !=
+	        JUICE_ERR_SUCCESS ||
+	    juice_set_ice_transport_policy(agent2, JUICE_ICE_TRANSPORT_POLICY_RELAY) !=
+	        JUICE_ERR_SUCCESS) {
 		juice_destroy(agent1);
 		juice_destroy(agent2);
 		juice_server_destroy(server);
