@@ -89,12 +89,15 @@ int test_remote_description_early_stun(void) {
 	if (!preserved) {
 		char candidate[ADDR_MAX_STRING_LEN];
 		char transport[ADDR_MAX_STRING_LEN];
-		addr_record_to_string(&pair->remote->resolved, candidate, sizeof(candidate));
+		if (pair->remote)
+			addr_record_to_string(&pair->remote->resolved, candidate, sizeof(candidate));
+		else
+			snprintf(candidate, sizeof(candidate), "missing");
 		addr_record_to_string(&entry->record, transport, sizeof(transport));
 		fprintf(stderr,
 		        "BUG: late remote SDP overwrote a live early-check candidate: "
 		        "pair remote=%s (type=%d), transport=%s\n",
-		        candidate, (int)pair->remote->type, transport);
+		        candidate, pair->remote ? (int)pair->remote->type : -1, transport);
 	}
 
 	juice_destroy(agent);
