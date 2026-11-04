@@ -525,53 +525,6 @@ int agent_get_local_description(juice_agent_t *agent, char *buffer, size_t size)
 	return 0;
 }
 
-// A signaled candidate may already exist as a peer-reflexive candidate
-// learned from an earlier authenticated connectivity check. Its array slot
-// must remain stable because candidate pairs hold pointers to that slot.
-static int agent_add_signaled_remote_candidate(juice_agent_t *agent, ice_candidate_t *candidate) {
-	for (int i = 0; i < agent->remote.candidates_count; ++i) {
-		ice_candidate_t *known = agent->remote.candidates + i;
-		if (known->component != candidate->component ||
-		    known->transport != candidate->transport ||
-		    !addr_record_is_equal(&known->resolved, &candidate->resolved, true))
-			continue;
-
-		// Only identify a previously discovered peer-reflexive endpoint (or
-		// an identical type) with the signaled candidate. An address alone
-		// cannot establish redundancy between other candidate types.
-		if (known->type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE &&
-		    known->type != candidate->type)
-			continue;
-
-		bool const priority_changed = known->priority != candidate->priority;
-		JLOG_INFO("PRIVACY_TRACE ICE_REMOTE_RECONCILED previous_type=%d signaled_type=%d "
-		          "priority_changed=%d",
-		          (int)known->type, (int)candidate->type, (int)priority_changed);
-		known->type = candidate->type;
-		known->priority = candidate->priority;
-		strcpy(known->foundation, candidate->foundation);
-		strcpy(known->hostname, candidate->hostname);
-		strcpy(known->service, candidate->service);
-
-		if (priority_changed) {
-			for (int j = 0; j < agent->candidate_pairs_count; ++j) {
-				ice_candidate_pair_t *pair = agent->candidate_pairs + j;
-				if (pair->remote == known)
-					ice_update_candidate_pair(pair, agent->mode == AGENT_MODE_CONTROLLING);
-			}
-			// Do not reset transactions or pair states for checks in flight.
-			agent_update_ordered_pairs(agent);
-		}
-		return 0;
-	}
-
-	if (ice_add_candidate(candidate, &agent->remote))
-		return -1;
-
-	ice_candidate_t *added = agent->remote.candidates + agent->remote.candidates_count - 1;
-	return agent_add_candidate_pairs_for_remote(agent, added);
-}
-
 int agent_set_remote_description(juice_agent_t *agent, const char *sdp) {
 	conn_lock(agent);
 	JLOG_VERBOSE("Setting remote SDP description: %s", sdp);
@@ -608,10 +561,7 @@ int agent_set_remote_description(juice_agent_t *agent, const char *sdp) {
 		return JUICE_ERR_FAILED;
 	}
 
-	// Remote peer-reflexive candidates can be discovered by authenticated
-	// connectivity checks before the SDP arrives. Existing candidate pairs
-	// point into agent->remote.candidates, so replacing the description would
-	// silently change those pairs' remote candidates.
+	// Preserve existing candidates referenced by active pairs.
 	strcpy(agent->remote.ice_ufrag, remote.ice_ufrag);
 	strcpy(agent->remote.ice_pwd, remote.ice_pwd);
 	agent->remote.ice_lite = remote.ice_lite;
@@ -637,8 +587,13 @@ int agent_set_remote_description(juice_agent_t *agent, const char *sdp) {
 	}
 	JLOG_DEBUG("Adding %d candidates from remote description", (int)remote.candidates_count);
 	for (int i = 0; i < remote.candidates_count; ++i) {
-		if (agent_add_signaled_remote_candidate(agent, remote.candidates + i))
-			JLOG_WARN("Failed to add remote candidate from description");
+		if (ice_add_candidate(remote.candidates + i, &agent->remote)) {
+			JLOG_WARN("Failed to add candidate from remote description");
+			continue;
+		}
+		ice_candidate_t *remote = agent->remote.candidates + agent->remote.candidates_count - 1;
+		if (agent_add_candidate_pairs_for_remote(agent, remote))
+			JLOG_WARN("Failed to add candidate pair");
 	}
 
 	conn_unlock(agent);
@@ -667,8 +622,14 @@ int agent_add_remote_candidate(juice_agent_t *agent, const char *sdp) {
 		conn_unlock(agent);
 		return JUICE_ERR_INVALID;
 	}
-	if (agent_add_signaled_remote_candidate(agent, &candidate)) {
-		JLOG_WARN("Failed to add remote candidate or candidate pair");
+	if (ice_add_candidate(&candidate, &agent->remote)) {
+		JLOG_ERROR("Failed to add candidate to remote description");
+		conn_unlock(agent);
+		return JUICE_ERR_FAILED;
+	}
+	ice_candidate_t *remote = agent->remote.candidates + agent->remote.candidates_count - 1;
+	if (agent_add_candidate_pairs_for_remote(agent, remote)) {
+		JLOG_WARN("Failed to add candidate pair");
 		conn_unlock(agent);
 		return JUICE_ERR_FAILED;
 	}
