@@ -97,7 +97,7 @@ typedef enum juice_ice_tcp_mode {
 
 typedef enum juice_ice_transport_policy {
 	JUICE_ICE_TRANSPORT_POLICY_ALL = 0, // Allow direct and relayed ICE connections
-	JUICE_ICE_TRANSPORT_POLICY_RELAY,   // Require a locally relayed ICE candidate
+	JUICE_ICE_TRANSPORT_POLICY_RELAY,   // Use only TURN relays
 } juice_ice_transport_policy_t;
 
 typedef struct juice_config {
@@ -120,7 +120,6 @@ typedef struct juice_config {
 	juice_cb_recv_t cb_recv;
 
 	void *user_ptr;
-
 
 } juice_config_t;
 

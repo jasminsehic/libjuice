@@ -200,7 +200,7 @@ void agent_destroy(juice_agent_t *agent) {
 
 static bool has_nonnumeric_server_hostnames(const juice_agent_t *agent) {
 	const juice_config_t *config = &agent->config;
-	if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY &&
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL &&
 	    config->stun_server_host && !addr_is_numeric_hostname(config->stun_server_host))
 		return true;
 
@@ -246,7 +246,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 	addr_record_t records[ICE_MAX_CANDIDATES_COUNT - 1];
 	int records_count = 0;
-	if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY) {
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL) {
 		records_count = conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
 		if (records_count < 0) {
 			JLOG_ERROR("Failed to gather local host candidates");
@@ -259,9 +259,8 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 	conn_lock(agent);
 
-	// Keep the UDP sockets needed for TURN allocations, but do not create
-	// host ICE candidates when the transport policy requires relaying.
-	if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY) {
+	// TURN still needs UDP sockets without host candidates.
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL) {
 		JLOG_VERBOSE("Adding %d local host candidates", records_count);
 		for (int i = 0; i < records_count; ++i) {
 			ice_candidate_t candidate;
@@ -281,7 +280,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		}
 	}
 
-	if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY &&
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL &&
 	    agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE) {
 		if (records_count > 0) {
 			// RFC 6544: The connection-address encoded into the candidate-attribute for
@@ -457,7 +456,7 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 	// STUN server resolution
 	// The entry is added after so the TURN server address will be matched in priority
-	if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY &&
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL &&
 	    agent->config.stun_server_host) {
 		if (!agent->config.stun_server_port)
 			agent->config.stun_server_port = 3478; // default STUN port
@@ -1417,9 +1416,8 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			JLOG_WARN("STUN message verification failed");
 			return -1;
 		}
-		// Only learn remote reflexive candidates from checks delivered by TURN
-		// when relay-only policy is active. A direct check must not add a path.
-		if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY || relayed) {
+		if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL ||
+		    (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_RELAY && relayed != NULL)) {
 			if (agent_add_remote_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE,
 			                                         msg->priority, src)) {
 				JLOG_WARN("Failed to add remote peer reflexive candidate from STUN message");
@@ -2568,7 +2566,7 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // lo
 int agent_add_candidate_pairs_for_remote(juice_agent_t *agent, ice_candidate_t *remote) {
 	// Here is the trick: local non-relayed candidates are undifferentiated for sending.
 	// Therefore, we don't need to match remote candidates with local ones.
-	if (agent->ice_transport_policy != JUICE_ICE_TRANSPORT_POLICY_RELAY &&
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_ALL &&
 	    agent_add_candidate_pair(agent, NULL, remote))
 		return -1;
 

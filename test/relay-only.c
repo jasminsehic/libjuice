@@ -74,7 +74,6 @@ static int test_relay_only_filtering(void) {
 	if (!agent)
 		return -1;
 
-	// The policy is an opt-in setter, not part of the public config ABI.
 	bool const api_ok =
 	    juice_set_ice_transport_policy(NULL, JUICE_ICE_TRANSPORT_POLICY_RELAY) ==
 	        JUICE_ERR_INVALID &&
@@ -164,8 +163,7 @@ static int test_relay_only_filtering(void) {
 		                   ? agent_input(agent, stun_packet, (size_t)stun_size, &source, NULL)
 		                   : 0;
 
-		// An unmatched direct request reaches ordinary ICE dispatch and is
-		// ignored. It must not create a direct pair or a peer-reflexive path.
+		// Direct packets must not create an ICE path or deliver data.
 		success = data_ret < 0 && stun_size > 0 && stun_ret == 0 &&
 		          !observation.received_data && agent->candidate_pairs_count == 0 &&
 		          agent->entries_count == 0 &&
@@ -182,7 +180,6 @@ static int test_relay_only_filtering(void) {
 			        ice_candidates_count(&agent->remote, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE),
 			        agent->candidate_pairs_count);
 
-		// Parsing a remote host candidate must not create a direct path.
 		char const remote_sdp[] =
 		    "a=ice-ufrag:remote\r\n"
 		    "a=ice-pwd:0123456789012345678901\r\n"
