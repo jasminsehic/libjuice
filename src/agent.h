@@ -140,6 +140,10 @@ struct juice_agent {
 	ice_candidate_pair_t *selected_pair;
 	// Report accepted data only once per selected ICE path.
 	ice_candidate_pair_t *last_logged_udp_pair;
+	ice_candidate_pair_t *last_logged_udp_send_pair;
+	bool logged_stun_binding_via_turn;
+	bool logged_standalone_stun;
+	bool logged_direct_ice_binding;
 	int candidate_pairs_count;
 
 	agent_stun_entry_t entries[MAX_STUN_ENTRIES_COUNT];

@@ -695,14 +695,31 @@ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
 	}
 
 	if (selected_entry->relay_entry) {
-		// The datagram should be sent through the relay, use a channel to minimize overhead
-		conn_lock(agent); // We have to lock
+		// Relayed application data must be encapsulated as TURN ChannelData.
+		conn_lock(agent);
 		int ret = agent_channel_send(agent, selected_entry->relay_entry, &selected_entry->record,
 		                             data, size, ds);
+		if (ret >= 0 && selected_entry->pair &&
+		    agent->last_logged_udp_send_pair != selected_entry->pair && JLOG_INFO_ENABLED) {
+			char next_hop[ADDR_MAX_STRING_LEN];
+			char peer[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(&selected_entry->relay_entry->record, next_hop, sizeof(next_hop));
+			addr_record_to_string(&selected_entry->record, peer, sizeof(peer));
+			JLOG_INFO("PRIVACY_TRACE RTC_DATA_SEND path=turn_channel relay_only=%d "
+			          "udp_next_hop=%s logical_peer=%s violation=0",
+			          (int)(agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_RELAY),
+			          next_hop, peer);
+			agent->last_logged_udp_send_pair = selected_entry->pair;
+		}
 		conn_unlock(agent);
 		return ret;
 	}
 
+	// Never silently fall back to a direct peer UDP send under relay-only.
+	if (agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_RELAY) {
+		JLOG_ERROR("PRIVACY_TRACE RTC_DATA_SEND path=direct relay_only=1 blocked=1 violation=1");
+		return -1;
+	}
 	return agent_direct_send(agent, &selected_entry->record, data, size, ds);
 }
 
@@ -865,44 +882,38 @@ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t
 
 	case AGENT_STUN_ENTRY_TYPE_CHECK:
 		JLOG_DEBUG("Received application datagram");
-		// The selected SDP address can differ from the source address actually
-		// observed by the UDP socket. Emit once per selected path, not per packet.
+		// TURN Data indications and ChannelData carry decoded peer addresses.
+		// The outer UDP source is the TURN server, not the decoded peer.
 		if (entry->pair && entry->pair == agent->selected_pair &&
 		    agent->last_logged_udp_pair != entry->pair && JLOG_INFO_ENABLED) {
-			const addr_record_t *socket_src =
-			    relayed && entry->relay_entry ? &entry->relay_entry->record : src;
+			const bool relay_only = agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_RELAY;
+			const bool via_turn = relayed && entry->relay_entry;
+			const addr_record_t *udp_src = via_turn ? &entry->relay_entry->record : src;
 			agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
-			char socket_address[ADDR_MAX_STRING_LEN];
+			bool const selected_via_turn = selected_entry && selected_entry->relay_entry;
+			char udp_source[ADDR_MAX_STRING_LEN];
 			char peer_address[ADDR_MAX_STRING_LEN];
 			char selected_address[ADDR_MAX_STRING_LEN];
-			char transport_address[ADDR_MAX_STRING_LEN];
-			char packet_entry_address[ADDR_MAX_STRING_LEN];
 			char local_address[ADDR_MAX_STRING_LEN];
-			addr_record_to_string(socket_src, socket_address, sizeof(socket_address));
+			char packet_peer[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(udp_src, udp_source, sizeof(udp_source));
 			addr_record_to_string(src, peer_address, sizeof(peer_address));
 			addr_record_to_string(&entry->pair->remote->resolved, selected_address,
 			                      sizeof(selected_address));
-			addr_record_to_string(&entry->record, packet_entry_address,
-			                      sizeof(packet_entry_address));
-			if (selected_entry)
-				addr_record_to_string(&selected_entry->record, transport_address,
-				                      sizeof(transport_address));
-			else
-				snprintf(transport_address, sizeof(transport_address), "unknown");
+			addr_record_to_string(&entry->record, packet_peer, sizeof(packet_peer));
 			if (entry->pair->local)
 				addr_record_to_string(&entry->pair->local->resolved, local_address,
 				                      sizeof(local_address));
 			else
 				snprintf(local_address, sizeof(local_address), "unknown");
-			JLOG_INFO("PRIVACY_TRACE RTC_UDP_SELECTED mode=%s socket_source=%s "
-			          "logical_peer=%s selected_remote=%s selected_local=%s "
-			          "selected_transport=%s packet_transport=%s "
-			          "transport_matches_source=%d selected_entry_matches_packet=%d",
-			          relayed ? "turn" : "direct", socket_address, peer_address,
-			          selected_address, local_address, transport_address,
-			          packet_entry_address,
-			          selected_entry && addr_record_is_equal(&selected_entry->record, src, true),
-			          selected_entry == entry);
+			JLOG_INFO("PRIVACY_TRACE RTC_UDP_SELECTED path=%s relay_only=%d udp_source=%s "
+			          "decoded_peer=%s selected_remote=%s local_allocation=%s "
+			          "packet_peer=%s selected_entry_relay=%d selected_entry_matches_packet=%d "
+			          "violation=%d",
+			          via_turn ? "turn" : "direct", (int)relay_only, udp_source,
+			          peer_address, selected_address, local_address, packet_peer,
+			          (int)selected_via_turn, (int)(selected_entry == entry),
+			          (int)(relay_only && (!via_turn || !selected_via_turn)));
 			agent->last_logged_udp_pair = entry->pair;
 		}
 		if (agent->config.cb_recv)
@@ -1830,6 +1841,15 @@ int agent_send_stun_binding(juice_agent_t *agent, agent_stun_entry_t *entry, stu
 		return -1;
 	}
 
+	bool const relay_only = agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_RELAY;
+	if (relay_only && !entry->relay_entry &&
+	    (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK ||
+	     entry->type == AGENT_STUN_ENTRY_TYPE_SERVER)) {
+		JLOG_ERROR("PRIVACY_TRACE ICE_STUN_ROUTE kind=direct_binding path=blocked "
+		           "relay_only=1 violation=1");
+		return -1;
+	}
+
 	if (entry->relay_entry) {
 		// The datagram must be sent through the relay
 		JLOG_DEBUG("Sending STUN message via relay");
@@ -1843,10 +1863,17 @@ int agent_send_stun_binding(juice_agent_t *agent, agent_stun_entry_t *entry, stu
 			JLOG_WARN("STUN message send via relay failed");
 			return -1;
 		}
+		if (!agent->logged_stun_binding_via_turn && JLOG_INFO_ENABLED) {
+			char next_hop[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(&entry->relay_entry->record, next_hop, sizeof(next_hop));
+			JLOG_INFO("PRIVACY_TRACE ICE_STUN_ROUTE kind=ice_binding path=turn "
+			          "relay_only=%d udp_next_hop=%s violation=0", (int)relay_only, next_hop);
+			agent->logged_stun_binding_via_turn = true;
+		}
 		return 0;
 	}
 
-	// Direct send
+	// A non-relayed connectivity check or a standalone STUN server request.
 	int ret = agent_direct_send(agent, &entry->record, buffer, size, 0);
 	if (ret < 0) {
 		if (ret == -SENETUNREACH)
@@ -1855,6 +1882,18 @@ int agent_send_stun_binding(juice_agent_t *agent, agent_stun_entry_t *entry, stu
 			JLOG_WARN("STUN message send failed");
 
 		return -1;
+	}
+	bool *logged = entry->type == AGENT_STUN_ENTRY_TYPE_SERVER
+	                   ? &agent->logged_standalone_stun
+	                   : &agent->logged_direct_ice_binding;
+	if (!*logged && JLOG_INFO_ENABLED) {
+		char next_hop[ADDR_MAX_STRING_LEN];
+		addr_record_to_string(&entry->record, next_hop, sizeof(next_hop));
+		JLOG_INFO("PRIVACY_TRACE ICE_STUN_ROUTE kind=%s path=direct relay_only=%d "
+		          "udp_next_hop=%s violation=%d",
+		          entry->type == AGENT_STUN_ENTRY_TYPE_SERVER ? "standalone_stun" : "ice_binding",
+		          (int)relay_only, next_hop, (int)relay_only);
+		*logged = true;
 	}
 	return 0;
 }
@@ -1927,8 +1966,13 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 		if (JLOG_INFO_ENABLED) {
 			char relayed_str[ADDR_MAX_STRING_LEN];
-			addr_record_to_string(&entry->relayed, relayed_str, ADDR_MAX_STRING_LEN);
-			JLOG_INFO("Allocated TURN relayed address %s", relayed_str);
+			char server_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(&entry->relayed, relayed_str, sizeof(relayed_str));
+			addr_record_to_string(&entry->record, server_str, sizeof(server_str));
+			JLOG_INFO("PRIVACY_TRACE TURN_ALLOCATION status=success server=%s "
+			          "local_allocation=%s relay_only=%d",
+			          server_str, relayed_str,
+			          (int)(agent->ice_transport_policy == JUICE_ICE_TRANSPORT_POLICY_RELAY));
 		}
 
 		agent_update_gathering_done(agent);
