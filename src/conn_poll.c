@@ -598,6 +598,29 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 	return 0;
 }
 
+void conn_poll_stop_datagrams(juice_agent_t *agent) {
+	conn_impl_t *conn_impl = agent->conn_impl;
+	conn_poll_lock(agent);
+	mutex_lock(&conn_impl->send_mutex);
+	conn_impl->state = CONN_STATE_FINISHED;
+	if (agent->proxy)
+		socks5_close(agent->proxy);
+	else if (conn_impl->udp_sock != INVALID_SOCKET)
+		closesocket(conn_impl->udp_sock);
+	conn_impl->udp_sock = INVALID_SOCKET;
+	if (conn_impl->tcp_sock != INVALID_SOCKET) {
+		closesocket(conn_impl->tcp_sock);
+		conn_impl->tcp_sock = INVALID_SOCKET;
+	}
+	atomic_store(&agent->selected_entry, NULL);
+	mutex_unlock(&conn_impl->send_mutex);
+	agent->state = JUICE_STATE_FAILED;
+	JLOG_INFO("RTC_PROXY_TRACE datagrams stopped transport=%s id=%p",
+	          agent->proxy ? "socks5" : "direct", (void *)agent);
+	conn_poll_unlock(agent);
+	conn_poll_interrupt(agent);
+}
+
 void conn_poll_cleanup(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 
@@ -606,9 +629,10 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 	mutex_destroy(&conn_impl->send_mutex);
 	if (agent->proxy)
 		socks5_close(agent->proxy);
-	else
+	else if (conn_impl->udp_sock != INVALID_SOCKET)
 		closesocket(conn_impl->udp_sock);
-	closesocket(conn_impl->tcp_sock);
+	if (conn_impl->tcp_sock != INVALID_SOCKET)
+		closesocket(conn_impl->tcp_sock);
 	free(agent->conn_impl);
 	agent->conn_impl = NULL;
 }
@@ -662,7 +686,9 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
 	int ret;
-	if (!agent->proxy && dst->socktype == SOCK_STREAM) {
+	if (conn_impl->udp_sock == INVALID_SOCKET) {
+		ret = -1;
+	} else if (!agent->proxy && dst->socktype == SOCK_STREAM) {
 		tcp_ice_write_context_t *context = &conn_impl->tcp_ice_write_context;
 		if (!context->pending) {
 			ret = tcp_ice_write(conn_impl->tcp_sock, data, size, context);
@@ -720,7 +746,7 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
 
 	mutex_lock(&conn_impl->registry->mutex);
 	mutex_lock(&conn_impl->send_mutex);
-	if (conn_impl->tcp_sock == INVALID_SOCKET) {
+	if (conn_impl->udp_sock != INVALID_SOCKET && conn_impl->tcp_sock == INVALID_SOCKET) {
 		if (JLOG_DEBUG_ENABLED) {
 			char dst_str[ADDR_MAX_STRING_LEN];
 			addr_record_to_string(dst, dst_str, ADDR_MAX_STRING_LEN);

@@ -222,7 +222,7 @@ static thread_return_t THREAD_CALL resolver_thread_entry(void *arg) {
 
 int agent_gather_candidates(juice_agent_t *agent) {
 	JLOG_VERBOSE("Gathering candidates");
-	if (agent->proxy && agent->state == JUICE_STATE_FAILED)
+	if (agent->state == JUICE_STATE_FAILED)
 		return -1;
 
 	if (agent->conn_impl) {
@@ -269,7 +269,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		records_count = ICE_MAX_CANDIDATES_COUNT - 1;
 
 	conn_lock(agent);
-	if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+	if (agent->state == JUICE_STATE_FAILED) {
 		conn_unlock(agent);
 		return -1;
 	}
@@ -365,7 +365,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 int agent_resolve_servers(juice_agent_t *agent) {
 	conn_lock(agent);
-	if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+	if (agent->state == JUICE_STATE_FAILED) {
 		conn_unlock(agent);
 		return -1;
 	}
@@ -406,7 +406,7 @@ int agent_resolve_servers(juice_agent_t *agent) {
 			    addr_resolve(hostname, service, SOCK_DGRAM, records, DEFAULT_MAX_RECORDS_COUNT);
 
 			conn_lock(agent);
-			if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+			if (agent->state == JUICE_STATE_FAILED) {
 				conn_unlock(agent);
 				return -1;
 			}
@@ -501,7 +501,7 @@ int agent_resolve_servers(juice_agent_t *agent) {
 		    addr_resolve(hostname, service, SOCK_DGRAM, records, MAX_STUN_SERVER_RECORDS_COUNT);
 
 		conn_lock(agent);
-		if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+		if (agent->state == JUICE_STATE_FAILED) {
 			conn_unlock(agent);
 			return -1;
 		}

@@ -9,6 +9,7 @@
 #include "juice.h"
 #include "addr.h"
 #include "agent.h"
+#include "conn_poll.h"
 #include "ice.h"
 
 #ifndef NO_SERVER
@@ -28,6 +29,15 @@ JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config) {
 JUICE_EXPORT void juice_destroy(juice_agent_t *agent) {
 	if (agent)
 		agent_destroy(agent);
+}
+
+JUICE_EXPORT int juice_stop_datagrams(juice_agent_t *agent) {
+	if (!agent || agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL)
+		return JUICE_ERR_INVALID;
+
+	if (agent->conn_impl)
+		conn_poll_stop_datagrams(agent);
+	return JUICE_ERR_SUCCESS;
 }
 
 JUICE_EXPORT int juice_gather_candidates(juice_agent_t *agent) {
