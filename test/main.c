@@ -29,6 +29,7 @@ int test_stun_unhandled_no_host(void);
 int test_stun_unhandled_unhandle(void);
 int test_tcp(void);
 int test_tcp_bad_candidate(void);
+int test_socks5(void);
 
 #ifndef NO_SERVER
 int test_server(void);
@@ -114,6 +115,12 @@ int main(int argc, char **argv) {
 	printf("\nRunning ufrag test...\n");
 	if (test_ufrag()) {
 		fprintf(stderr, "Ufrag test failed\n");
+		return -1;
+	}
+
+	printf("\nRunning SOCKS5 UDP proxy test...\n");
+	if (test_socks5()) {
+		fprintf(stderr, "SOCKS5 UDP proxy test failed\n");
 		return -1;
 	}
 

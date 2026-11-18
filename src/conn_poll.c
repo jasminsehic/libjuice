@@ -154,6 +154,8 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		}
 
 		size++;
+		if (agent->proxy)
+			size++;
 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
 			size++;
 		}
@@ -198,6 +200,12 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 
 		assert(i < pfds->size);
 
+		if (agent->proxy) {
+			struct pollfd *proxy_pfd = pfds->pfds + i++;
+			proxy_pfd->fd = agent->proxy->control_sock;
+			proxy_pfd->events = POLLIN;
+		}
+
 		struct pollfd *udp_pfd = pfds->pfds + i;
 		udp_pfd->fd = conn_impl->udp_sock;
 		udp_pfd->events = POLLIN;
@@ -218,8 +226,9 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		}
 	}
 
+	int count = size > 1 ? (int)size - 1 : (registry->agents_count ? 1 : 0);
 	mutex_unlock(&registry->mutex);
-	return size - 1;
+	return count;
 
 error:
 	mutex_unlock(&registry->mutex);
@@ -231,6 +240,10 @@ void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
 
 	if (pfd->revents & POLLNVAL) {
 		JLOG_WARN("Invalid socket");
+		if (agent->proxy) {
+			conn_impl->state = CONN_STATE_FINISHED;
+			agent_conn_fail(agent);
+		}
 		return;
 	}
 
@@ -246,10 +259,15 @@ void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
 		int ret = 0;
 		int left = 1000; // limit for fairness between sockets
 		while (left--) {
-			if ((ret = conn_poll_recv_udp(conn_impl->udp_sock, buffer, BUFFER_SIZE,
-							&src)) <= 0) {
-				break;
+			if (agent->proxy) {
+				ret = socks5_recv(agent->proxy, buffer, BUFFER_SIZE, &src);
+				if (ret == 0)
+					continue;
+			} else {
+				ret = conn_poll_recv_udp(conn_impl->udp_sock, buffer, BUFFER_SIZE, &src);
 			}
+			if (ret <= 0)
+				break;
 
 			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 				JLOG_WARN("Agent receive failed");
@@ -261,7 +279,7 @@ void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
 		if (conn_impl->state == CONN_STATE_FINISHED)
 			return;
 
-		if (ret > 0) {
+		if (ret >= 0) {
 			// There are more datagrams but we need to give other sockets a turn
 			JLOG_VERBOSE("Fairness limit reached, will continue on next poll");
 		} else if (ret == -SEAGAIN || ret == -SEWOULDBLOCK) {
@@ -471,12 +489,33 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 		if (i >= pfds->size)
 			break;
 
+		if (agent->proxy) {
+			struct pollfd *proxy_pfd = pfds->pfds + i++;
+			if (proxy_pfd->fd != agent->proxy->control_sock || i >= pfds->size)
+				break;
+			if (proxy_pfd->revents) {
+				JLOG_WARN("SOCKS5 control connection lost");
+				mutex_lock(&conn_impl->send_mutex);
+				socks5_close(agent->proxy);
+				mutex_unlock(&conn_impl->send_mutex);
+				conn_impl->state = CONN_STATE_FINISHED;
+				agent_conn_fail(agent);
+				++i; // Skip the UDP descriptor
+				continue;
+			}
+		}
+
 		struct pollfd *udp_pfd = pfds->pfds + i;
 		if (udp_pfd->fd != conn_impl->udp_sock)
 			break;
 
 		conn_poll_process_udp(agent, udp_pfd);
 		i++;
+		if (agent->proxy && conn_impl->state == CONN_STATE_FINISHED) {
+			mutex_lock(&conn_impl->send_mutex);
+			socks5_close(agent->proxy);
+			mutex_unlock(&conn_impl->send_mutex);
+		}
 
 		if (conn_impl->tcp_sock == INVALID_SOCKET)
 			continue;
@@ -540,7 +579,7 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 		return -1;
 	}
 
-	conn_impl->udp_sock = udp_create_socket(config);
+	conn_impl->udp_sock = agent->proxy ? agent->proxy->udp_sock : udp_create_socket(config);
 	if (conn_impl->udp_sock == INVALID_SOCKET) {
 		JLOG_ERROR("UDP socket creation failed");
 		free(conn_impl);
@@ -564,7 +603,10 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 	conn_poll_interrupt(agent);
 
 	mutex_destroy(&conn_impl->send_mutex);
-	closesocket(conn_impl->udp_sock);
+	if (agent->proxy)
+		socks5_close(agent->proxy);
+	else
+		closesocket(conn_impl->udp_sock);
 	closesocket(conn_impl->tcp_sock);
 	free(agent->conn_impl);
 	agent->conn_impl = NULL;
@@ -619,7 +661,7 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
 	int ret;
-	if (dst->socktype == SOCK_STREAM) {
+	if (!agent->proxy && dst->socktype == SOCK_STREAM) {
 		tcp_ice_write_context_t *context = &conn_impl->tcp_ice_write_context;
 		if (!context->pending) {
 			ret = tcp_ice_write(conn_impl->tcp_sock, data, size, context);
@@ -629,6 +671,8 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 			// another datagram is buffered, drop
 			ret = -SEAGAIN;
 		}
+	} else if (agent->proxy && agent->proxy->udp_sock == INVALID_SOCKET) {
+		ret = -1;
 	} else {
 		if (conn_impl->send_ds >= 0 && conn_impl->send_ds != ds) {
 			JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
@@ -638,9 +682,13 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 				conn_impl->send_ds = -1; // disable for next time
 		}
 
-		ret = udp_sendto(conn_impl->udp_sock, data, size, dst);
-		if (ret < 0)
-			ret = -sockerrno;
+		if (agent->proxy) {
+			ret = socks5_send(agent->proxy, dst, data, size);
+		} else {
+			ret = udp_sendto(conn_impl->udp_sock, data, size, dst);
+			if (ret < 0)
+				ret = -sockerrno;
+		}
 	}
 
 	if (ret < 0) {
@@ -656,7 +704,21 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 	return ret;
 }
 
+int conn_poll_send_domain(juice_agent_t *agent, const char *host, uint16_t port,
+                          const char *data, size_t size) {
+	if (!agent->proxy || !agent->conn_impl)
+		return -1;
+	conn_impl_t *conn_impl = agent->conn_impl;
+	mutex_lock(&conn_impl->send_mutex);
+	int ret = socks5_send_domain(agent->proxy, host, port, data, size);
+	mutex_unlock(&conn_impl->send_mutex);
+	return ret;
+}
+
 void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
+	if (agent->proxy)
+		return;
+
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	mutex_lock(&conn_impl->registry->mutex);
@@ -678,5 +740,5 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
 int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 
-	return udp_get_addrs(conn_impl->udp_sock, records, size);
+	return agent->proxy ? 0 : udp_get_addrs(conn_impl->udp_sock, records, size);
 }

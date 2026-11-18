@@ -7,6 +7,7 @@
  */
 
 #include "agent.h"
+#include "conn_poll.h"
 #include "ice.h"
 #include "juice.h"
 #include "log.h"
@@ -188,6 +189,10 @@ void agent_destroy(juice_agent_t *agent) {
 	}
 	free(agent->config.turn_servers);
 	free((void *)agent->config.bind_address);
+	if (agent->proxy) {
+		socks5_close(agent->proxy);
+		free(agent->proxy);
+	}
 	free(agent);
 
 #ifdef _WIN32
@@ -218,6 +223,9 @@ static thread_return_t THREAD_CALL resolver_thread_entry(void *arg) {
 
 int agent_gather_candidates(juice_agent_t *agent) {
 	JLOG_VERBOSE("Gathering candidates");
+	if (agent->proxy && agent->state == JUICE_STATE_FAILED)
+		return -1;
+
 	if (agent->conn_impl) {
 		JLOG_WARN("Candidates gathering already started");
 		return 0;
@@ -236,22 +244,36 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	socket_config.port_begin = agent->config.local_port_range_begin;
 	socket_config.port_end = agent->config.local_port_range_end;
 
+	if (agent->proxy && socks5_open(agent->proxy, &socket_config) < 0) {
+		JLOG_ERROR("SOCKS5 UDP association failed");
+		agent_change_state(agent, JUICE_STATE_FAILED);
+		return -1;
+	}
+
 	if (conn_create(agent, &socket_config)) {
 		JLOG_FATAL("Connection creation for agent failed");
+		if (agent->proxy) {
+			socks5_close(agent->proxy);
+			agent_change_state(agent, JUICE_STATE_FAILED);
+		}
 		return -1;
 	}
 
 	addr_record_t records[ICE_MAX_CANDIDATES_COUNT - 1];
-	int records_count = conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
+	int records_count = agent->proxy ? 0 : conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
 	if (records_count < 0) {
 		JLOG_ERROR("Failed to gather local host candidates");
 		records_count = 0;
-	} else if (records_count == 0) {
+	} else if (records_count == 0 && !agent->proxy) {
 		JLOG_WARN("No local host candidates gathered");
 	} else if (records_count > ICE_MAX_CANDIDATES_COUNT - 1)
 		records_count = ICE_MAX_CANDIDATES_COUNT - 1;
 
 	conn_lock(agent);
+	if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+		conn_unlock(agent);
+		return -1;
+	}
 
 	JLOG_VERBOSE("Adding %d local host candidates", records_count);
 	for (int i = 0; i < records_count; ++i) {
@@ -323,7 +345,8 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	conn_unlock(agent);
 	conn_interrupt(agent);
 
-	if (has_nonnumeric_server_hostnames(&agent->config)) {
+	if (!(agent->proxy && agent->proxy->proxy_hostnames) &&
+	    has_nonnumeric_server_hostnames(&agent->config)) {
 		// Resolve server hostnames in a separate thread as it may block
 		JLOG_DEBUG("Starting resolver thread for servers");
 		int ret = thread_init(&agent->resolver_thread, resolver_thread_entry, agent);
@@ -342,8 +365,24 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	return 0;
 }
 
+static int resolve_server(juice_agent_t *agent, const char *host, const char *service,
+                          addr_record_t *records, size_t count) {
+	if (agent->proxy && agent->proxy->proxy_hostnames && !addr_is_numeric_hostname(host)) {
+		if (!*host || strlen(host) > 255)
+			return -1;
+		memset(records, 0, sizeof(*records));
+		records->socktype = SOCK_DGRAM;
+		return 1;
+	}
+	return addr_resolve(host, service, SOCK_DGRAM, records, count);
+}
+
 int agent_resolve_servers(juice_agent_t *agent) {
 	conn_lock(agent);
+	if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+		conn_unlock(agent);
+		return -1;
+	}
 
 	// TURN server resolution
 	juice_concurrency_mode_t mode = agent->config.concurrency_mode;
@@ -373,9 +412,13 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 			addr_record_t records[DEFAULT_MAX_RECORDS_COUNT];
 			int records_count =
-			    addr_resolve(hostname, service, SOCK_DGRAM, records, DEFAULT_MAX_RECORDS_COUNT);
+			    resolve_server(agent, turn_server->host, service, records, DEFAULT_MAX_RECORDS_COUNT);
 
 			conn_lock(agent);
+			if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+				conn_unlock(agent);
+				return -1;
+			}
 
 			if (records_count > 0) {
 				if (records_count > DEFAULT_MAX_RECORDS_COUNT)
@@ -391,7 +434,7 @@ int agent_resolve_servers(juice_agent_t *agent) {
 						record = records + j;
 						break;
 					}
-					if (family == AF_INET6 && !record)
+					if ((family == AF_INET6 || !records[j].len) && !record)
 						record = records + j;
 				}
 				if (record) {
@@ -400,7 +443,11 @@ int agent_resolve_servers(juice_agent_t *agent) {
 					for (int i = 0; i < agent->entries_count; ++i) {
 						agent_stun_entry_t *entry = agent->entries + i;
 						if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
-						    addr_record_is_equal(&entry->record, record, true)) {
+						    ((record->len && entry->record.len &&
+						      addr_record_is_equal(&entry->record, record, true)) ||
+						     (!record->len && entry->proxy_hostname &&
+						      entry->proxy_port == turn_server->port &&
+						      strcmp(entry->proxy_hostname, turn_server->host) == 0))) {
 							is_duplicate = true;
 							break;
 						}
@@ -417,6 +464,10 @@ int agent_resolve_servers(juice_agent_t *agent) {
 					entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
 					entry->pair = NULL;
 					entry->record = *record;
+					if (!record->len) {
+						entry->proxy_hostname = turn_server->host;
+						entry->proxy_port = turn_server->port;
+					}
 					entry->turn_redirections = 0;
 					entry->turn = calloc(1, sizeof(agent_turn_state_t));
 					if (!entry->turn) {
@@ -459,9 +510,14 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 		addr_record_t records[MAX_STUN_SERVER_RECORDS_COUNT];
 		int records_count =
-		    addr_resolve(hostname, service, SOCK_DGRAM, records, MAX_STUN_SERVER_RECORDS_COUNT);
+		    resolve_server(agent, agent->config.stun_server_host, service, records,
+		                   MAX_STUN_SERVER_RECORDS_COUNT);
 
 		conn_lock(agent);
+		if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+			conn_unlock(agent);
+			return -1;
+		}
 
 		if (records_count > 0) {
 			if (records_count > MAX_STUN_SERVER_RECORDS_COUNT)
@@ -478,6 +534,10 @@ int agent_resolve_servers(juice_agent_t *agent) {
 				entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
 				entry->pair = NULL;
 				entry->record = records[i];
+				if (!entry->record.len) {
+					entry->proxy_hostname = agent->config.stun_server_host;
+					entry->proxy_port = agent->config.stun_server_port;
+				}
 				juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 				entry->transaction_id_expired = false;
 				++agent->entries_count;
@@ -695,6 +755,13 @@ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
 	return agent_direct_send(agent, &selected_entry->record, data, size, ds);
 }
 
+static int agent_send_entry(juice_agent_t *agent, const agent_stun_entry_t *entry,
+                            const char *data, size_t size, int ds) {
+	if (entry->proxy_hostname && !entry->record.len)
+		return conn_poll_send_domain(agent, entry->proxy_hostname, entry->proxy_port, data, size);
+	return agent_direct_send(agent, &entry->record, data, size, ds);
+}
+
 int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                       int ds) {
 	return conn_send(agent, dst, data, size, ds);
@@ -732,7 +799,7 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 		return -1;
 	}
 
-	return agent_direct_send(agent, &entry->record, buffer, size, ds);
+	return agent_send_entry(agent, entry, buffer, size, ds);
 }
 
 int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *record,
@@ -758,7 +825,7 @@ int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const ad
 		return -1;
 	}
 
-	return agent_direct_send(agent, &entry->record, buffer, len, ds);
+	return agent_send_entry(agent, entry, buffer, len, ds);
 }
 
 juice_state_t agent_get_state(juice_agent_t *agent) {
@@ -941,7 +1008,10 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			if (entry->retransmissions >= 0) {
 				if (JLOG_DEBUG_ENABLED) {
 					char record_str[ADDR_MAX_STRING_LEN];
-					addr_record_to_string(&entry->record, record_str, ADDR_MAX_STRING_LEN);
+					if (entry->proxy_hostname && !entry->record.len)
+						snprintf(record_str, sizeof(record_str), "%s", entry->proxy_hostname);
+					else
+						addr_record_to_string(&entry->record, record_str, ADDR_MAX_STRING_LEN);
 					if (entry->retransmissions == 0) {
 						JLOG_DEBUG("STUN entry %d: Sending request to %s (no retransmission)", i,
 						           record_str);
@@ -1356,6 +1426,34 @@ int agent_verify_credentials(juice_agent_t *agent, const agent_stun_entry_t *ent
 	return 0;
 }
 
+static bool pin_proxy_server(juice_agent_t *agent, agent_stun_entry_t *entry,
+                             const addr_record_t *src, const addr_record_t *relayed) {
+	if (!entry->proxy_hostname)
+		return true;
+	if (relayed || !src->len || src->socktype != SOCK_DGRAM)
+		return false;
+	if (entry->record.len)
+		return addr_record_is_equal(&entry->record, src, true);
+	if (entry->state != AGENT_STUN_ENTRY_STATE_PENDING ||
+	    addr_get_port((const struct sockaddr *)&src->addr) != entry->proxy_port)
+		return false;
+	if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY) {
+		for (int i = 0; i < agent->entries_count; ++i) {
+			agent_stun_entry_t *other = agent->entries + i;
+			if (other != entry && other->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
+			    other->record.len && addr_record_is_equal(&other->record, src, true)) {
+				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				entry->next_transmission = 0;
+				agent_update_gathering_done(agent);
+				return false;
+			}
+		}
+	}
+	// Keep the selected server for the lifetime of this UDP association.
+	entry->record = *src;
+	return true;
+}
+
 int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_message_t *msg,
                         const addr_record_t *src, const addr_record_t *relayed) {
 	if (msg->msg_method == STUN_METHOD_BINDING && msg->has_integrity) {
@@ -1400,6 +1498,11 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
 			return -1;
 		}
+		if (entry->proxy_hostname &&
+		    (entry->type != AGENT_STUN_ENTRY_TYPE_SERVER || !STUN_IS_RESPONSE(msg->msg_class) ||
+		     msg->has_integrity || (msg->msg_class == STUN_CLASS_RESP_SUCCESS && !msg->mapped.len) ||
+		     !pin_proxy_server(agent, entry, src, relayed)))
+			return -1;
 		return agent_process_stun_binding(agent, msg, entry, src, relayed);
 
 	case STUN_METHOD_ALLOCATE:
@@ -1409,6 +1512,14 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			          "authentication disabled?)");
 			return -1;
 		}
+		if (entry->proxy_hostname &&
+		    (entry->type != AGENT_STUN_ENTRY_TYPE_RELAY || !STUN_IS_RESPONSE(msg->msg_class) ||
+		     (!entry->record.len &&
+		      (msg->msg_method != STUN_METHOD_ALLOCATE ||
+		       (msg->msg_class == STUN_CLASS_RESP_ERROR && msg->error_code == 401 &&
+		        (!*msg->credentials.realm || !*msg->credentials.nonce)))) ||
+		     !pin_proxy_server(agent, entry, src, relayed)))
+			return -1;
 		return agent_process_turn_allocate(agent, msg, entry);
 
 	case STUN_METHOD_CREATE_PERMISSION:
@@ -1416,6 +1527,9 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			JLOG_WARN("Ignoring TURN CreatePermission message with invalid credentials");
 			return -1;
 		}
+		if (entry->proxy_hostname && (!entry->record.len ||
+		    !pin_proxy_server(agent, entry, src, relayed)))
+			return -1;
 		return agent_process_turn_create_permission(agent, msg, entry);
 
 	case STUN_METHOD_CHANNEL_BIND:
@@ -1423,6 +1537,9 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			JLOG_WARN("Ignoring TURN ChannelBind message with invalid credentials");
 			return -1;
 		}
+		if (entry->proxy_hostname && (!entry->record.len ||
+		    !pin_proxy_server(agent, entry, src, relayed)))
+			return -1;
 		return agent_process_turn_channel_bind(agent, msg, entry);
 
 	case STUN_METHOD_DATA:
@@ -1793,7 +1910,7 @@ int agent_send_stun_binding(juice_agent_t *agent, agent_stun_entry_t *entry, stu
 	}
 
 	// Direct send
-	int ret = agent_direct_send(agent, &entry->record, buffer, size, 0);
+	int ret = agent_send_entry(agent, entry, buffer, size, 0);
 	if (ret < 0) {
 		if (ret == -SENETUNREACH)
 			JLOG_INFO("STUN binding failed: Network unreachable");
@@ -2016,7 +2133,7 @@ int agent_send_turn_allocate_request(juice_agent_t *agent, const agent_stun_entr
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, 0) < 0) {
+	if (agent_send_entry(agent, entry, buffer, size, 0) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2113,7 +2230,7 @@ int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_e
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
+	if (agent_send_entry(agent, entry, buffer, size, ds) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2221,7 +2338,7 @@ int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
+	if (agent_send_entry(agent, entry, buffer, size, ds) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2764,6 +2881,9 @@ agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent, const add
 }
 
 int agent_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode) {
+	if (agent->proxy && ice_tcp_mode != JUICE_ICE_TCP_MODE_NONE)
+		return JUICE_ERR_INVALID;
+
 	if (agent->conn_impl) {
 		JLOG_WARN("Unable to set ICE attributes, candidates gathering already started");
 		return JUICE_ERR_FAILED;
@@ -2773,8 +2893,44 @@ int agent_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mo
 	return JUICE_ERR_SUCCESS;
 }
 
+int agent_set_socks5_proxy(juice_agent_t *agent, const juice_socks5_proxy_t *config) {
+	if (agent->state != JUICE_STATE_DISCONNECTED || agent->conn_impl ||
+	    agent->candidate_pairs_count || *agent->remote.ice_ufrag)
+		return JUICE_ERR_FAILED;
+
+	if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL ||
+	    agent->ice_tcp_mode != JUICE_ICE_TCP_MODE_NONE)
+		return JUICE_ERR_INVALID;
+
+	if (!config->host || !*config->host || strlen(config->host) > 255 || !config->port ||
+	    !!config->username != !!config->password ||
+	    (config->username && (!*config->username || !*config->password ||
+	                         strlen(config->username) > 255 || strlen(config->password) > 255)))
+		return JUICE_ERR_INVALID;
+
+	socks5_t *proxy = calloc(1, sizeof(*proxy));
+	if (!proxy)
+		return JUICE_ERR_FAILED;
+
+	strcpy(proxy->host, config->host);
+	proxy->port = config->port;
+	proxy->proxy_hostnames = config->proxy_hostnames;
+	if (config->username) {
+		strcpy(proxy->username, config->username);
+		strcpy(proxy->password, config->password);
+	}
+	proxy->control_sock = INVALID_SOCKET;
+	proxy->udp_sock = INVALID_SOCKET;
+	if (agent->proxy) {
+		socks5_close(agent->proxy);
+		free(agent->proxy);
+	}
+	agent->proxy = proxy;
+	return JUICE_ERR_SUCCESS;
+}
+
 void agent_translate_host_candidate_entry(juice_agent_t *agent, agent_stun_entry_t *entry) {
-	if (!entry->pair || entry->pair->remote->type != ICE_CANDIDATE_TYPE_HOST)
+	if (agent->proxy || !entry->pair || entry->pair->remote->type != ICE_CANDIDATE_TYPE_HOST)
 		return;
 
 #if defined(JUICE_ENABLE_LOCAL_ADDRESS_TRANSLATION) && JUICE_ENABLE_LOCAL_ADDRESS_TRANSLATION

@@ -95,6 +95,14 @@ typedef enum juice_ice_tcp_mode {
 	JUICE_ICE_TCP_MODE_ACTIVE,   // ICE-TCP will operate as a client
 } juice_ice_tcp_mode_t;
 
+typedef struct juice_socks5_proxy {
+	const char *host;
+	uint16_t port;
+	const char *username;
+	const char *password;
+	bool proxy_hostnames; // Resolve STUN/TURN hostnames through the proxy.
+} juice_socks5_proxy_t;
+
 typedef struct juice_config {
 	juice_concurrency_mode_t concurrency_mode;
 
@@ -138,6 +146,9 @@ JUICE_EXPORT int juice_set_local_ice_attributes(juice_agent_t *agent, const char
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 JUICE_EXPORT int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr);
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
+
+// Configure before setting the remote description or gathering candidates.
+JUICE_EXPORT int juice_set_socks5_proxy(juice_agent_t *agent, const juice_socks5_proxy_t *proxy);
 
 // ICE server
 

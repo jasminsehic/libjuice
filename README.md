@@ -32,9 +32,29 @@ The library implements a simplified full ICE agent ([RFC5245](https://www.rfc-ed
 The limitations compared to a fully-featured ICE agent are:
 - Only UDP is supported as transport protocol and other protocols are ignored.
 - Only one component is supported, which is sufficient for WebRTC Data Channels and multiplexed RTP+RTCP.
-- Only [RFC8828](https://www.rfc-editor.org/rfc/rfc8828) mode 2 is supported (default route + all local addresses).
+- Without a proxy, [RFC8828](https://www.rfc-editor.org/rfc/rfc8828) mode 2 is supported (default route + all local addresses).
+- Optional SOCKS5 UDP proxy support implements the UDP portion of [RFC8828 Section 5.2](https://www.rfc-editor.org/rfc/rfc8828.html#section-5.2), mode 4 (force proxy), using [RFC1928](https://www.rfc-editor.org/rfc/rfc1928) UDP ASSOCIATE and optional [RFC1929](https://www.rfc-editor.org/rfc/rfc1929) authentication.
 
 It also implements a lightweight STUN/TURN server ([RFC8489](https://www.rfc-editor.org/rfc/rfc8489.html) and [RFC8656](https://www.rfc-editor.org/rfc/rfc8656.html)). The server can be disabled at compile-time with the `NO_SERVER` flag.
+
+### SOCKS5 UDP proxy
+
+Set the proxy before setting the remote description or gathering candidates:
+
+```c
+juice_socks5_proxy_t proxy = {
+    .host = "127.0.0.1",
+    .port = 1080,
+    .proxy_hostnames = true,
+};
+if (juice_set_socks5_proxy(agent, &proxy) != JUICE_ERR_SUCCESS) {
+    // Handle unsupported or invalid proxy configuration.
+}
+```
+
+The proxy must support UDP ASSOCIATE. All agent UDP traffic (STUN, ICE connectivity checks, TURN and application data) uses the association; local host candidates are not advertised. Proxy negotiation failure or loss of the TCP control connection fails the agent without a direct fallback. The configuration is copied by the agent. Set both `username` and `password` for authentication.
+
+This option currently supports polling concurrency mode and UDP only; ICE-TCP and other concurrency modes are rejected. Gathering performs synchronous proxy negotiation with a five-second I/O deadline; local hostname resolution may take longer. With `proxy_hostnames` enabled, STUN and TURN hostnames are forwarded in RFC1928 domain-name UDP headers without local DNS resolution or fallback. The first matching server response selects the numeric endpoint for subsequent requests for the lifetime of the UDP association, including TURN authentication and allocation. The proxy and its UDP relay must have numeric addresses in this mode. UDP response headers must contain numeric addresses. Unresolved peer candidates are not supported. With `proxy_hostnames` disabled (the default), server hostnames are resolved locally. This is not full RFC8828 mode 4 support: there is no proxied TCP fallback.
 
 ## Dependencies
 
