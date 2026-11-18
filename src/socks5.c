@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define SOCKS5_TIMEOUT 5000
-#define SOCKS5_MAX_HEADER 22
+#define SOCKS5_MAX_HEADER 262
 #define SOCKS5_MAX_DATAGRAM 65507
 
 static int wait_socket(socket_t sock, short events, timestamp_t deadline) {
@@ -83,6 +83,18 @@ int socks5_encode_address(const addr_record_t *record, unsigned char *buffer, si
 		return 19;
 	}
 	return -1;
+}
+
+int socks5_encode_domain(const char *host, uint16_t port, unsigned char *buffer, size_t size) {
+	size_t len = strlen(host);
+	if (!len || len > 255 || !port || size < len + 4)
+		return -1;
+	buffer[0] = 3;
+	buffer[1] = (unsigned char)len;
+	memcpy(buffer + 2, host, len);
+	buffer[len + 2] = (unsigned char)(port >> 8);
+	buffer[len + 3] = (unsigned char)port;
+	return (int)len + 4;
 }
 
 int socks5_decode_address(const unsigned char *buffer, size_t size, addr_record_t *record) {
@@ -158,7 +170,7 @@ static int associate(socks5_t *proxy, const addr_record_t *server, timestamp_t d
 		if (read_all(sock, response + 1, length - 1, deadline) ||
 		    socks5_decode_address(response, length, &proxy->relay) < 0)
 			return -1;
-	} else if (type == 3) {
+	} else if (type == 3 && !proxy->proxy_hostnames) {
 		if (read_all(sock, response, 1, deadline) || !response[0])
 			return -1;
 		size_t length = response[0];
@@ -192,6 +204,8 @@ static int associate(socks5_t *proxy, const addr_record_t *server, timestamp_t d
 }
 
 int socks5_open(socks5_t *proxy, const udp_socket_config_t *config) {
+	if (proxy->proxy_hostnames && !addr_is_numeric_hostname(proxy->host))
+		return -1;
 	char service[8];
 	snprintf(service, sizeof(service), "%hu", proxy->port);
 	addr_record_t records[8];
@@ -224,12 +238,14 @@ void socks5_close(socks5_t *proxy) {
 	}
 }
 
-int socks5_send(socks5_t *proxy, const addr_record_t *dst, const char *data, size_t size) {
+static int socks5_send_to(socks5_t *proxy, const addr_record_t *dst, const char *host,
+                         uint16_t port, const char *data, size_t size) {
 	if (proxy->control_sock == INVALID_SOCKET || proxy->udp_sock == INVALID_SOCKET ||
-	    dst->socktype != SOCK_DGRAM)
+	    (!host && dst->socktype != SOCK_DGRAM))
 		return -1;
 	unsigned char header[SOCKS5_MAX_HEADER] = {0};
-	int length = socks5_encode_address(dst, header + 3, sizeof(header) - 3);
+	int length = host ? socks5_encode_domain(host, port, header + 3, sizeof(header) - 3)
+	                  : socks5_encode_address(dst, header + 3, sizeof(header) - 3);
 	if (length < 0)
 		return -1;
 	size_t header_size = (size_t)length + 3;
@@ -256,6 +272,15 @@ int socks5_send(socks5_t *proxy, const addr_record_t *dst, const char *data, siz
 	if (packet != stack)
 		free(packet);
 	return ret;
+}
+
+int socks5_send(socks5_t *proxy, const addr_record_t *dst, const char *data, size_t size) {
+	return socks5_send_to(proxy, dst, NULL, 0, data, size);
+}
+
+int socks5_send_domain(socks5_t *proxy, const char *host, uint16_t port, const char *data,
+                      size_t size) {
+	return socks5_send_to(proxy, NULL, host, port, data, size);
 }
 
 int socks5_recv(socks5_t *proxy, char *buffer, size_t size, addr_record_t *src) {

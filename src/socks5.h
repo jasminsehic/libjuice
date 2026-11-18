@@ -16,6 +16,7 @@ typedef struct socks5 {
 	char username[256];
 	char password[256];
 	uint16_t port;
+	bool proxy_hostnames;
 	socket_t control_sock;
 	socket_t udp_sock;
 	addr_record_t relay;
@@ -24,6 +25,8 @@ typedef struct socks5 {
 int socks5_open(socks5_t *proxy, const udp_socket_config_t *config);
 void socks5_close(socks5_t *proxy);
 int socks5_send(socks5_t *proxy, const addr_record_t *dst, const char *data, size_t size);
+int socks5_send_domain(socks5_t *proxy, const char *host, uint16_t port, const char *data, size_t size);
+int socks5_encode_domain(const char *host, uint16_t port, unsigned char *buffer, size_t size);
 int socks5_recv(socks5_t *proxy, char *buffer, size_t size, addr_record_t *src);
 int socks5_encode_address(const addr_record_t *record, unsigned char *buffer, size_t size);
 int socks5_decode_address(const unsigned char *buffer, size_t size, addr_record_t *record);

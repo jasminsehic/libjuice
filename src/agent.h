@@ -111,6 +111,8 @@ typedef struct agent_stun_entry {
 	agent_mode_t mode;
 	ice_candidate_pair_t *pair;
 	addr_record_t record;
+	const char *proxy_hostname;
+	uint16_t proxy_port;
 	addr_record_t relayed;
 	uint8_t transaction_id[STUN_TRANSACTION_ID_SIZE];
 	timestamp_t next_transmission;

@@ -45,6 +45,7 @@ Set the proxy before setting the remote description or gathering candidates:
 juice_socks5_proxy_t proxy = {
     .host = "127.0.0.1",
     .port = 1080,
+    .proxy_hostnames = true,
 };
 if (juice_set_socks5_proxy(agent, &proxy) != JUICE_ERR_SUCCESS) {
     // Handle unsupported or invalid proxy configuration.
@@ -53,7 +54,7 @@ if (juice_set_socks5_proxy(agent, &proxy) != JUICE_ERR_SUCCESS) {
 
 The proxy must support UDP ASSOCIATE. All agent UDP traffic (STUN, ICE connectivity checks, TURN and application data) uses the association; local host candidates are not advertised. Proxy negotiation failure or loss of the TCP control connection fails the agent without a direct fallback. The configuration is copied by the agent. Set both `username` and `password` for authentication.
 
-This option currently supports polling concurrency mode and UDP only; ICE-TCP and other concurrency modes are rejected. Gathering performs synchronous proxy negotiation with a five-second I/O deadline; local hostname resolution may take longer. Hostnames are resolved locally, and UDP response headers must contain numeric addresses. This is not full RFC8828 mode 4 support: there is no proxied TCP fallback or proxy-side DNS resolution.
+This option currently supports polling concurrency mode and UDP only; ICE-TCP and other concurrency modes are rejected. Gathering performs synchronous proxy negotiation with a five-second I/O deadline; local hostname resolution may take longer. With `proxy_hostnames` enabled, STUN and TURN hostnames are forwarded in RFC1928 domain-name UDP headers without local DNS resolution or fallback. The first matching server response selects the numeric endpoint for subsequent requests for the lifetime of the UDP association, including TURN authentication and allocation. The proxy and its UDP relay must have numeric addresses in this mode. UDP response headers must contain numeric addresses. Unresolved peer candidates are not supported. With `proxy_hostnames` disabled (the default), server hostnames are resolved locally. This is not full RFC8828 mode 4 support: there is no proxied TCP fallback.
 
 ## Dependencies
 
