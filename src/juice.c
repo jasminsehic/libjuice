@@ -37,6 +37,8 @@ JUICE_EXPORT int juice_stop_datagrams(juice_agent_t *agent) {
 
 	if (agent->conn_impl)
 		conn_poll_stop_datagrams(agent);
+	else
+		agent->state = JUICE_STATE_FAILED;
 	return JUICE_ERR_SUCCESS;
 }
 

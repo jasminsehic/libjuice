@@ -384,6 +384,12 @@ static int test_connection(bool turn) {
 	    !wait_flag(&pa.received) || !wait_flag(&pb.received))
 		goto done;
 
+	if (juice_stop_datagrams(b) != JUICE_ERR_SUCCESS ||
+	    juice_get_state(b) != JUICE_STATE_FAILED ||
+	    juice_send(b, "test", 4) == JUICE_ERR_SUCCESS ||
+	    juice_gather_candidates(b) == JUICE_ERR_SUCCESS)
+		goto done;
+
 	atomic_store(&fixture.stop, true);
 	thread_join(fixture.thread, NULL);
 	started = false;
