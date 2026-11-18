@@ -116,6 +116,7 @@ typedef struct proxy_fixture {
 	uint16_t turn_port;
 	bool require_auth;
 	bool remote_dns;
+	bool reject_domain;
 	atomic(bool) saw_domain;
 	atomic(bool) saw_numeric_server;
 	atomic(bool) repeated_domain;
@@ -135,11 +136,15 @@ static void sleep_ms(unsigned int ms) {
 #endif
 }
 
-static bool wait_flag(atomic(bool) *flag) {
-	timestamp_t deadline = current_timestamp() + 5000;
+static bool wait_flag_timeout(atomic(bool) *flag, timediff_t timeout) {
+	timestamp_t deadline = current_timestamp() + timeout;
 	while (!atomic_load(flag) && current_timestamp() < deadline)
 		sleep_ms(20);
 	return atomic_load(flag);
+}
+
+static bool wait_flag(atomic(bool) *flag) {
+	return wait_flag_timeout(flag, 5000);
 }
 
 static int transfer(socket_t sock, unsigned char *buffer, size_t size, bool writing) {
@@ -245,6 +250,8 @@ static thread_return_t THREAD_CALL proxy_run(void *arg) {
 				if (atomic_load(&proxy->saw_numeric_server))
 					atomic_store(&proxy->repeated_domain, true);
 				atomic_store(&proxy->saw_domain, true);
+				if (proxy->reject_domain)
+					continue;
 			} else if (buffer[3] == 1) {
 				header = 10;
 				memcpy(&addr->sin_addr, buffer + 4, 4);
@@ -274,6 +281,12 @@ static thread_return_t THREAD_CALL proxy_run(void *arg) {
 			const struct sockaddr_in *addr = (const struct sockaddr_in *)&src.addr;
 			memcpy(buffer + 4, &addr->sin_addr, 4);
 			memcpy(buffer + 8, &addr->sin_port, 2);
+			if (proxy->remote_dns && ntohs(addr->sin_port) == proxy->port &&
+			    !atomic_load(&proxy->saw_numeric_server)) {
+				buffer[9] ^= 1;
+				udp_sendto(proxy->relay, (const char *)buffer, (size_t)len + 10, &client);
+				buffer[9] ^= 1;
+			}
 			udp_sendto(proxy->relay, (const char *)buffer, (size_t)len + 10, &client);
 		}
 	}
@@ -317,7 +330,7 @@ static bool connected(juice_agent_t *agent) {
 	return state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED;
 }
 
-static int test_connection(bool turn, bool remote_dns) {
+static int test_connection(bool turn, bool remote_dns, bool reject_domain) {
 	juice_server_credentials_t credentials = {"turn-user", "turn-password", 0};
 	juice_server_config_t server_config = {0};
 	server_config.bind_address = "127.0.0.1";
@@ -334,6 +347,7 @@ static int test_connection(bool turn, bool remote_dns) {
 	fixture.turn_port = turn ? fixture.port : 0;
 	fixture.require_auth = turn;
 	fixture.remote_dns = remote_dns;
+	fixture.reject_domain = reject_domain;
 	bool started = false;
 	int ret = -1;
 	juice_agent_t *a = NULL, *b = NULL;
@@ -394,8 +408,20 @@ static int test_connection(bool turn, bool remote_dns) {
 	    juice_set_remote_description(b, sdp) ||
 	    juice_get_local_description(b, sdp, sizeof(sdp)) ||
 	    juice_set_remote_description(a, sdp) ||
-	    juice_gather_candidates(a) || juice_gather_candidates(b) ||
-	    !wait_flag(&fixture.ready) || !wait_flag(&pa.gathered))
+	    juice_gather_candidates(a) || !wait_flag(&fixture.ready))
+		goto done;
+
+	if (reject_domain) {
+		if (!wait_flag(&fixture.saw_domain) ||
+		    !wait_flag_timeout(&pa.gathered, 35000) ||
+		    juice_get_local_description(a, sdp, sizeof(sdp)) ||
+		    strstr(sdp, "typ host") || strstr(sdp, "typ srflx") ||
+		    strstr(sdp, "typ relay") || atomic_load(&fixture.saw_numeric_server))
+			goto done;
+		ret = 0;
+		goto done;
+	}
+	if (juice_gather_candidates(b) || !wait_flag(&pa.gathered))
 		goto done;
 
 	if (juice_get_local_description(a, sdp, sizeof(sdp)) || strstr(sdp, "typ host") ||
@@ -461,8 +487,9 @@ int test_socks5(void) {
 	if (test_addresses() || test_refused())
 		return -1;
 #ifndef NO_SERVER
-	if (test_connection(false, false) || test_connection(true, false) ||
-	    test_connection(false, true) || test_connection(true, true))
+	if (test_connection(false, false, false) || test_connection(true, false, false) ||
+	    test_connection(false, true, false) || test_connection(true, true, false) ||
+	    test_connection(false, true, true))
 		return -1;
 #endif
 	return 0;
