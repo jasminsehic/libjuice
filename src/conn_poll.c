@@ -738,6 +738,17 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 	return ret;
 }
 
+int conn_poll_send_domain(juice_agent_t *agent, const char *host, uint16_t port,
+                          const char *data, size_t size) {
+	if (!agent->proxy || !agent->conn_impl)
+		return -1;
+	conn_impl_t *conn_impl = agent->conn_impl;
+	mutex_lock(&conn_impl->send_mutex);
+	int ret = socks5_send_domain(agent->proxy, host, port, data, size);
+	mutex_unlock(&conn_impl->send_mutex);
+	return ret;
+}
+
 void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
 	if (agent->proxy)
 		return;

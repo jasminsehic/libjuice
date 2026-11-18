@@ -42,6 +42,20 @@ static int test_addresses(void) {
 		    socks5_decode_address(buffer, (size_t)len - 1, &decoded) >= 0)
 			return -1;
 	}
+	unsigned char domain[259];
+	char host[257];
+	memset(host, 'a', sizeof(host));
+	host[255] = 0;
+	if (socks5_encode_domain(host, 3478, domain, sizeof(domain)) != 259 ||
+	    domain[0] != 3 || domain[1] != 255 || memcmp(domain + 2, host, 255) ||
+	    domain[257] != 13 || domain[258] != 150 ||
+	    socks5_encode_domain(host, 3478, domain, sizeof(domain) - 1) >= 0 ||
+	    socks5_encode_domain("", 3478, domain, sizeof(domain)) >= 0)
+		return -1;
+	host[255] = 'a';
+	host[256] = 0;
+	if (socks5_encode_domain(host, 3478, domain, sizeof(domain)) >= 0)
+		return -1;
 	return 0;
 }
 
@@ -62,7 +76,7 @@ static int test_refused(void) {
 	    getsockname(refused, (struct sockaddr *)&addr, &addrlen))
 		goto done;
 
-	juice_socks5_proxy_t proxy = {"127.0.0.1", ntohs(addr.sin_port), NULL, NULL, true};
+	juice_socks5_proxy_t proxy = {"127.0.0.1", ntohs(addr.sin_port), NULL, NULL, false};
 	if (juice_set_socks5_proxy(agent, &proxy) != JUICE_ERR_SUCCESS ||
 	    juice_set_ice_tcp_mode(agent, JUICE_ICE_TCP_MODE_ACTIVE) == JUICE_ERR_SUCCESS ||
 	    juice_gather_candidates(agent) == JUICE_ERR_SUCCESS ||
@@ -101,6 +115,10 @@ typedef struct proxy_fixture {
 	uint16_t port;
 	uint16_t turn_port;
 	bool require_auth;
+	bool remote_dns;
+	atomic(bool) saw_domain;
+	atomic(bool) saw_numeric_server;
+	atomic(bool) repeated_domain;
 	atomic(bool) stop;
 	atomic(bool) ready;
 	atomic(bool) saw_peer;
@@ -208,14 +226,34 @@ static thread_return_t THREAD_CALL proxy_run(void *arg) {
 			unsigned char buffer[4096];
 			addr_record_t src;
 			int len = udp_recvfrom(proxy->relay, (char *)buffer, sizeof(buffer), &src);
-			if (len <= 10 || buffer[0] || buffer[1] || buffer[2] || buffer[3] != 1)
+			if (len <= 10 || buffer[0] || buffer[1] || buffer[2])
 				continue;
 			client = src;
 			addr_record_t dst = {0};
 			struct sockaddr_in *addr = (struct sockaddr_in *)&dst.addr;
 			addr->sin_family = AF_INET;
-			memcpy(&addr->sin_addr, buffer + 4, 4);
-			memcpy(&addr->sin_port, buffer + 8, 2);
+			size_t header;
+			if (buffer[3] == 3) {
+				const char host[] = "ice-proxy-test.invalid";
+				size_t n = buffer[4];
+				header = n + 7;
+				if (!proxy->remote_dns || n != sizeof(host) - 1 || (size_t)len <= header ||
+				    memcmp(buffer + 5, host, n))
+					continue;
+				addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+				memcpy(&addr->sin_port, buffer + 5 + n, 2);
+				if (atomic_load(&proxy->saw_numeric_server))
+					atomic_store(&proxy->repeated_domain, true);
+				atomic_store(&proxy->saw_domain, true);
+			} else if (buffer[3] == 1) {
+				header = 10;
+				memcpy(&addr->sin_addr, buffer + 4, 4);
+				memcpy(&addr->sin_port, buffer + 8, 2);
+				if (ntohs(addr->sin_port) == proxy->port)
+					atomic_store(&proxy->saw_numeric_server, true);
+			} else {
+				continue;
+			}
 			dst.len = sizeof(*addr);
 			dst.socktype = SOCK_DGRAM;
 			if (ntohs(addr->sin_port) == proxy->port)
@@ -225,7 +263,7 @@ static thread_return_t THREAD_CALL proxy_run(void *arg) {
 					continue; // Force TURN for this test.
 				atomic_store(&proxy->saw_peer, true);
 			}
-			udp_sendto(proxy->egress, (const char *)buffer + 10, (size_t)len - 10, &dst);
+			udp_sendto(proxy->egress, (const char *)buffer + header, (size_t)len - header, &dst);
 		}
 		if (pfds[2].revents & POLLIN) {
 			unsigned char buffer[4096] = {0, 0, 0, 1};
@@ -279,7 +317,7 @@ static bool connected(juice_agent_t *agent) {
 	return state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED;
 }
 
-static int test_connection(bool turn) {
+static int test_connection(bool turn, bool remote_dns) {
 	juice_server_credentials_t credentials = {"turn-user", "turn-password", 0};
 	juice_server_config_t server_config = {0};
 	server_config.bind_address = "127.0.0.1";
@@ -295,6 +333,7 @@ static int test_connection(bool turn) {
 	fixture.port = juice_server_get_port(server);
 	fixture.turn_port = turn ? fixture.port : 0;
 	fixture.require_auth = turn;
+	fixture.remote_dns = remote_dns;
 	bool started = false;
 	int ret = -1;
 	juice_agent_t *a = NULL, *b = NULL;
@@ -320,7 +359,8 @@ static int test_connection(bool turn) {
 		goto done;
 	started = true;
 
-	juice_turn_server_t turn_server = {"127.0.0.1", credentials.username, credentials.password,
+	const char *ice_host = remote_dns ? "ice-proxy-test.invalid" : "127.0.0.1";
+	juice_turn_server_t turn_server = {ice_host, credentials.username, credentials.password,
 	                                  fixture.port};
 	juice_config_t config = {0};
 	config.bind_address = "127.0.0.1";
@@ -332,7 +372,7 @@ static int test_connection(bool turn) {
 		config.turn_servers = &turn_server;
 		config.turn_servers_count = 1;
 	} else {
-		config.stun_server_host = "127.0.0.1";
+		config.stun_server_host = ice_host;
 		config.stun_server_port = fixture.port;
 	}
 	a = juice_create(&config);
@@ -347,7 +387,7 @@ static int test_connection(bool turn) {
 	pb.other = a;
 
 	juice_socks5_proxy_t proxy = {"127.0.0.1", ntohs(addr.sin_port),
-	                             turn ? "user" : NULL, turn ? "pass" : NULL, true};
+	                             turn ? "user" : NULL, turn ? "pass" : NULL, remote_dns};
 	char sdp[JUICE_MAX_SDP_STRING_LEN];
 	if (juice_set_socks5_proxy(a, &proxy) ||
 	    juice_get_local_description(a, sdp, sizeof(sdp)) ||
@@ -360,7 +400,7 @@ static int test_connection(bool turn) {
 
 	if (juice_get_local_description(a, sdp, sizeof(sdp)) || strstr(sdp, "typ host") ||
 	    !strstr(sdp, turn ? "typ relay" : "typ srflx") ||
-	    !atomic_load(&fixture.saw_server))
+	    !atomic_load(&fixture.saw_server) || (remote_dns && !atomic_load(&fixture.saw_domain)))
 		goto done;
 
 	timestamp_t deadline = current_timestamp() + 5000;
@@ -388,6 +428,10 @@ static int test_connection(bool turn) {
 	    juice_get_state(b) != JUICE_STATE_FAILED ||
 	    juice_send(b, "test", 4) == JUICE_ERR_SUCCESS ||
 	    juice_gather_candidates(b) == JUICE_ERR_SUCCESS)
+		goto done;
+
+	if (remote_dns && turn && (!atomic_load(&fixture.saw_numeric_server) ||
+	                          atomic_load(&fixture.repeated_domain)))
 		goto done;
 
 	atomic_store(&fixture.stop, true);
@@ -423,7 +467,8 @@ int test_socks5(void) {
 	if (test_addresses() || test_refused())
 		return -1;
 #ifndef NO_SERVER
-	if (test_connection(false) || test_connection(true))
+	if (test_connection(false, false) || test_connection(true, false) ||
+	    test_connection(false, true) || test_connection(true, true))
 		return -1;
 #endif
 	return 0;
