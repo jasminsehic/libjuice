@@ -52,6 +52,7 @@ set(LIBJUICE_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/log.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/random.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/server.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/socks5.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/stun.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/timestamp.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/tcp.c
@@ -86,6 +87,7 @@ set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/bind.c
 	${CMAKE_CURRENT_SOURCE_DIR}/test/ufrag.c
 	${CMAKE_CURRENT_SOURCE_DIR}/test/tcp.c
+	${CMAKE_CURRENT_SOURCE_DIR}/test/socks5.c
 )
 source_group("Test Files" FILES "${TESTS_SOURCES}")
 

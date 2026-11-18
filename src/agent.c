@@ -188,6 +188,10 @@ void agent_destroy(juice_agent_t *agent) {
 	}
 	free(agent->config.turn_servers);
 	free((void *)agent->config.bind_address);
+	if (agent->proxy) {
+		socks5_close(agent->proxy);
+		free(agent->proxy);
+	}
 	free(agent);
 
 #ifdef _WIN32
@@ -218,6 +222,9 @@ static thread_return_t THREAD_CALL resolver_thread_entry(void *arg) {
 
 int agent_gather_candidates(juice_agent_t *agent) {
 	JLOG_VERBOSE("Gathering candidates");
+	if (agent->proxy && agent->state == JUICE_STATE_FAILED)
+		return -1;
+
 	if (agent->conn_impl) {
 		JLOG_WARN("Candidates gathering already started");
 		return 0;
@@ -236,22 +243,36 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	socket_config.port_begin = agent->config.local_port_range_begin;
 	socket_config.port_end = agent->config.local_port_range_end;
 
+	if (agent->proxy && socks5_open(agent->proxy, &socket_config) < 0) {
+		JLOG_ERROR("SOCKS5 UDP association failed");
+		agent_change_state(agent, JUICE_STATE_FAILED);
+		return -1;
+	}
+
 	if (conn_create(agent, &socket_config)) {
 		JLOG_FATAL("Connection creation for agent failed");
+		if (agent->proxy) {
+			socks5_close(agent->proxy);
+			agent_change_state(agent, JUICE_STATE_FAILED);
+		}
 		return -1;
 	}
 
 	addr_record_t records[ICE_MAX_CANDIDATES_COUNT - 1];
-	int records_count = conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
+	int records_count = agent->proxy ? 0 : conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
 	if (records_count < 0) {
 		JLOG_ERROR("Failed to gather local host candidates");
 		records_count = 0;
-	} else if (records_count == 0) {
+	} else if (records_count == 0 && !agent->proxy) {
 		JLOG_WARN("No local host candidates gathered");
 	} else if (records_count > ICE_MAX_CANDIDATES_COUNT - 1)
 		records_count = ICE_MAX_CANDIDATES_COUNT - 1;
 
 	conn_lock(agent);
+	if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+		conn_unlock(agent);
+		return -1;
+	}
 
 	JLOG_VERBOSE("Adding %d local host candidates", records_count);
 	for (int i = 0; i < records_count; ++i) {
@@ -344,6 +365,10 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 int agent_resolve_servers(juice_agent_t *agent) {
 	conn_lock(agent);
+	if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+		conn_unlock(agent);
+		return -1;
+	}
 
 	// TURN server resolution
 	juice_concurrency_mode_t mode = agent->config.concurrency_mode;
@@ -376,6 +401,10 @@ int agent_resolve_servers(juice_agent_t *agent) {
 			    addr_resolve(hostname, service, SOCK_DGRAM, records, DEFAULT_MAX_RECORDS_COUNT);
 
 			conn_lock(agent);
+			if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+				conn_unlock(agent);
+				return -1;
+			}
 
 			if (records_count > 0) {
 				if (records_count > DEFAULT_MAX_RECORDS_COUNT)
@@ -462,6 +491,10 @@ int agent_resolve_servers(juice_agent_t *agent) {
 		    addr_resolve(hostname, service, SOCK_DGRAM, records, MAX_STUN_SERVER_RECORDS_COUNT);
 
 		conn_lock(agent);
+		if (agent->proxy && agent->state == JUICE_STATE_FAILED) {
+			conn_unlock(agent);
+			return -1;
+		}
 
 		if (records_count > 0) {
 			if (records_count > MAX_STUN_SERVER_RECORDS_COUNT)
@@ -2764,6 +2797,9 @@ agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent, const add
 }
 
 int agent_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode) {
+	if (agent->proxy && ice_tcp_mode != JUICE_ICE_TCP_MODE_NONE)
+		return JUICE_ERR_INVALID;
+
 	if (agent->conn_impl) {
 		JLOG_WARN("Unable to set ICE attributes, candidates gathering already started");
 		return JUICE_ERR_FAILED;
@@ -2773,8 +2809,43 @@ int agent_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mo
 	return JUICE_ERR_SUCCESS;
 }
 
+int agent_set_socks5_proxy(juice_agent_t *agent, const juice_socks5_proxy_t *config) {
+	if (agent->state != JUICE_STATE_DISCONNECTED || agent->conn_impl ||
+	    agent->candidate_pairs_count || *agent->remote.ice_ufrag)
+		return JUICE_ERR_FAILED;
+
+	if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL ||
+	    agent->ice_tcp_mode != JUICE_ICE_TCP_MODE_NONE)
+		return JUICE_ERR_INVALID;
+
+	if (!config->host || !*config->host || strlen(config->host) > 255 || !config->port ||
+	    !!config->username != !!config->password ||
+	    (config->username && (!*config->username || !*config->password ||
+	                         strlen(config->username) > 255 || strlen(config->password) > 255)))
+		return JUICE_ERR_INVALID;
+
+	socks5_t *proxy = calloc(1, sizeof(*proxy));
+	if (!proxy)
+		return JUICE_ERR_FAILED;
+
+	strcpy(proxy->host, config->host);
+	proxy->port = config->port;
+	if (config->username) {
+		strcpy(proxy->username, config->username);
+		strcpy(proxy->password, config->password);
+	}
+	proxy->control_sock = INVALID_SOCKET;
+	proxy->udp_sock = INVALID_SOCKET;
+	if (agent->proxy) {
+		socks5_close(agent->proxy);
+		free(agent->proxy);
+	}
+	agent->proxy = proxy;
+	return JUICE_ERR_SUCCESS;
+}
+
 void agent_translate_host_candidate_entry(juice_agent_t *agent, agent_stun_entry_t *entry) {
-	if (!entry->pair || entry->pair->remote->type != ICE_CANDIDATE_TYPE_HOST)
+	if (agent->proxy || !entry->pair || entry->pair->remote->type != ICE_CANDIDATE_TYPE_HOST)
 		return;
 
 #if defined(JUICE_ENABLE_LOCAL_ADDRESS_TRANSLATION) && JUICE_ENABLE_LOCAL_ADDRESS_TRANSLATION

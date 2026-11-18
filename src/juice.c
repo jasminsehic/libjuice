@@ -224,3 +224,10 @@ int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mo
 
 	return agent_set_ice_tcp_mode(agent, ice_tcp_mode);
 }
+
+JUICE_EXPORT int juice_set_socks5_proxy(juice_agent_t *agent, const juice_socks5_proxy_t *proxy) {
+	if (!agent || !proxy)
+		return JUICE_ERR_INVALID;
+
+	return agent_set_socks5_proxy(agent, proxy);
+}
