@@ -16,6 +16,10 @@ typedef struct socks5 {
 	char username[256];
 	char password[256];
 	uint16_t port;
+	bool numeric_only;
+	unsigned long sent;
+	unsigned long received;
+	unsigned long dropped;
 	socket_t control_sock;
 	socket_t udp_sock;
 	addr_record_t relay;

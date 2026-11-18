@@ -244,7 +244,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	socket_config.port_end = agent->config.local_port_range_end;
 
 	if (agent->proxy && socks5_open(agent->proxy, &socket_config) < 0) {
-		JLOG_ERROR("SOCKS5 UDP association failed");
+		JLOG_ERROR("RTC_PROXY_TRACE SOCKS5 UDP association failed");
 		agent_change_state(agent, JUICE_STATE_FAILED);
 		return -1;
 	}
@@ -385,6 +385,11 @@ int agent_resolve_servers(juice_agent_t *agent) {
 			juice_turn_server_t *turn_server = agent->config.turn_servers + i;
 			if (!turn_server->host)
 				continue;
+			if (agent->proxy && agent->proxy->numeric_only &&
+			    !addr_is_numeric_hostname(turn_server->host)) {
+				JLOG_WARN("RTC_PROXY_TRACE DNS blocked: nonnumeric TURN server");
+				continue;
+			}
 
 			if (!turn_server->port)
 				turn_server->port = 3478; // default TURN port
@@ -475,7 +480,12 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 	// STUN server resolution
 	// The entry is added after so the TURN server address will be matched in priority
-	if (agent->config.stun_server_host) {
+	if (agent->config.stun_server_host && agent->proxy && agent->proxy->numeric_only &&
+	    !addr_is_numeric_hostname(agent->config.stun_server_host))
+		JLOG_WARN("RTC_PROXY_TRACE DNS blocked: nonnumeric STUN server");
+	if (agent->config.stun_server_host &&
+	    !(agent->proxy && agent->proxy->numeric_only &&
+	      !addr_is_numeric_hostname(agent->config.stun_server_host))) {
 		if (!agent->config.stun_server_port)
 			agent->config.stun_server_port = 3478; // default STUN port
 
@@ -2830,6 +2840,7 @@ int agent_set_socks5_proxy(juice_agent_t *agent, const juice_socks5_proxy_t *con
 
 	strcpy(proxy->host, config->host);
 	proxy->port = config->port;
+	proxy->numeric_only = config->numeric_only;
 	if (config->username) {
 		strcpy(proxy->username, config->username);
 		strcpy(proxy->password, config->password);

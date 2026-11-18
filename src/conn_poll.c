@@ -42,6 +42,7 @@ typedef struct conn_impl {
 	tcp_state_t tcp_state;
 	mutex_t send_mutex;
 	int send_ds;
+	bool direct_logged;
 	timestamp_t next_timestamp;
 } conn_impl_t;
 
@@ -494,7 +495,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			if (proxy_pfd->fd != agent->proxy->control_sock || i >= pfds->size)
 				break;
 			if (proxy_pfd->revents) {
-				JLOG_WARN("SOCKS5 control connection lost");
+				JLOG_WARN("RTC_PROXY_TRACE SOCKS5 control connection lost");
 				mutex_lock(&conn_impl->send_mutex);
 				socks5_close(agent->proxy);
 				mutex_unlock(&conn_impl->send_mutex);
@@ -685,6 +686,13 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 		if (agent->proxy) {
 			ret = socks5_send(agent->proxy, dst, data, size);
 		} else {
+			if (!conn_impl->direct_logged) {
+				char target[ADDR_MAX_STRING_LEN];
+				addr_record_to_string(dst, target, sizeof(target));
+				JLOG_INFO("RTC_PROXY_TRACE send id=%p transport=direct target=%s",
+				          (void *)agent, target);
+				conn_impl->direct_logged = true;
+			}
 			ret = udp_sendto(conn_impl->udp_sock, data, size, dst);
 			if (ret < 0)
 				ret = -sockerrno;

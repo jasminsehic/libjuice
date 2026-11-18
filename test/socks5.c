@@ -62,7 +62,7 @@ static int test_refused(void) {
 	    getsockname(refused, (struct sockaddr *)&addr, &addrlen))
 		goto done;
 
-	juice_socks5_proxy_t proxy = {"127.0.0.1", ntohs(addr.sin_port), NULL, NULL};
+	juice_socks5_proxy_t proxy = {"127.0.0.1", ntohs(addr.sin_port), NULL, NULL, true};
 	if (juice_set_socks5_proxy(agent, &proxy) != JUICE_ERR_SUCCESS ||
 	    juice_set_ice_tcp_mode(agent, JUICE_ICE_TCP_MODE_ACTIVE) == JUICE_ERR_SUCCESS ||
 	    juice_gather_candidates(agent) == JUICE_ERR_SUCCESS ||
@@ -347,7 +347,7 @@ static int test_connection(bool turn) {
 	pb.other = a;
 
 	juice_socks5_proxy_t proxy = {"127.0.0.1", ntohs(addr.sin_port),
-	                             turn ? "user" : NULL, turn ? "pass" : NULL};
+	                             turn ? "user" : NULL, turn ? "pass" : NULL, true};
 	char sdp[JUICE_MAX_SDP_STRING_LEN];
 	if (juice_set_socks5_proxy(a, &proxy) ||
 	    juice_get_local_description(a, sdp, sizeof(sdp)) ||

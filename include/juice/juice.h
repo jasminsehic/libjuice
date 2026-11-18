@@ -100,6 +100,7 @@ typedef struct juice_socks5_proxy {
 	uint16_t port;
 	const char *username;
 	const char *password;
+	bool numeric_only;
 } juice_socks5_proxy_t;
 
 typedef struct juice_config {
